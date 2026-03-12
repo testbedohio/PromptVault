@@ -1,0 +1,82 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+    overflow: hidden;
+    background-color: #2b2b2b;
+    color: #a9b7c6;
+    font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI",
+      sans-serif;
+  }
+
+  /* Custom scrollbar — Darcula style */
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: #2b2b2b;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: #515151;
+    border-radius: 4px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: #646464;
+  }
+
+  /* Selection highlight */
+  ::selection {
+    background-color: #214283;
+    color: #d4d4d4;
+  }
+}
+
+@layer components {
+  /* Resizable panel dividers */
+  .panel-divider {
+    @apply w-[3px] cursor-col-resize bg-darcula-border hover:bg-darcula-accent transition-colors flex-shrink-0;
+  }
+
+  /* Sidebar tree item */
+  .tree-item {
+    @apply flex items-center gap-2 px-3 py-1 text-sm font-mono cursor-pointer
+           rounded-sm transition-colors
+           text-darcula-text hover:bg-darcula-bg-lighter;
+  }
+
+  .tree-item.active {
+    @apply bg-darcula-selection text-darcula-text-bright;
+  }
+
+  /* Tab bar */
+  .editor-tab {
+    @apply flex items-center gap-2 px-3 py-1.5 text-xs font-mono
+           border-r border-darcula-border cursor-pointer transition-colors
+           text-darcula-text-muted hover:text-darcula-text;
+  }
+
+  .editor-tab.active {
+    @apply bg-darcula-bg text-darcula-text-bright border-t-2 border-t-darcula-accent;
+  }
+
+  /* Status bar badge */
+  .status-badge {
+    @apply inline-flex items-center gap-1 px-1.5 py-0.5 text-2xs font-mono
+           rounded-sm bg-darcula-bg-lighter text-darcula-text-muted;
+  }
+}
