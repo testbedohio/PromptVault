@@ -1,7 +1,7 @@
 mod db;
 mod sync;
 
-use db::{Database, Prompt, PromptVersion, Category, Tag};
+use db::{Database, Prompt, PromptVersion, Category, Tag, StoredEmbedding};
 use sync::{DriveSync, SyncConfig};
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex as StdMutex;
@@ -144,6 +144,42 @@ fn search_prompts(query: String, state: State<AppState>) -> ApiResult<Vec<Prompt
     }
 }
 
+// ─── Embedding Commands ──────────────────────────────────────────
+// These bridge the JS embedding engine to persistent SQLite storage.
+// Embeddings are generated in the frontend (Transformers.js / Gemini / Voyage)
+// and persisted here so the semantic search index survives app restarts.
+
+/// Persist a vector embedding for a prompt.
+/// `vector` is the f32 array from the JS embedding engine.
+/// `model` is e.g. "all-MiniLM-L6-v2", "text-embedding-004", "voyage-3-lite".
+/// `provider` is "local" | "gemini" | "claude".
+/// Uses INSERT OR REPLACE — safe to call after every save or re-embed.
+#[tauri::command]
+fn save_embedding(
+    prompt_id: i64,
+    vector: Vec<f32>,
+    model: String,
+    provider: String,
+    state: State<AppState>,
+) -> ApiResult<bool> {
+    match state.db.lock().unwrap().save_embedding(prompt_id, &vector, &model, &provider) {
+        Ok(_) => ok(true),
+        Err(e) => err(&e.to_string()),
+    }
+}
+
+/// Load all stored embeddings, optionally filtered to a specific model name.
+/// Called on startup to restore the in-memory index without re-embedding.
+/// Pass an empty string to load all embeddings regardless of model.
+#[tauri::command]
+fn get_all_embeddings(model: String, state: State<AppState>) -> ApiResult<Vec<StoredEmbedding>> {
+    let filter = if model.is_empty() { None } else { Some(model.as_str()) };
+    match state.db.lock().unwrap().get_all_embeddings(filter) {
+        Ok(embeddings) => ok(embeddings),
+        Err(e) => err(&e.to_string()),
+    }
+}
+
 // ─── Sync Commands ───────────────────────────────────────────────
 // These use tokio::sync::Mutex so the guard can be held across .await
 
@@ -225,6 +261,8 @@ pub fn run() {
             get_prompt_versions,
             get_all_tags,
             search_prompts,
+            save_embedding,
+            get_all_embeddings,
             get_sync_config,
             update_sync_config,
             get_auth_url,
