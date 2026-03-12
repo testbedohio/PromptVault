@@ -1,8 +1,8 @@
 # PromptVault — Session Handoff Document
 
-**Generated:** 2026-03-12
-**Repo:** https://github.com/testbedohio/PromptVault
-**Status:** All 4 phases complete, all files pushed to `main`
+**Generated:** 2026-03-12  
+**Repo:** https://github.com/testbedohio/PromptVault  
+**Status:** Phases 1–4 complete + Phase 5.1 (persistent embeddings) + Phase 5.2 (OAuth callback server)
 
 ---
 
@@ -10,7 +10,7 @@
 
 PromptVault is a cross-platform desktop app for power users to organize, search, and version-control LLM prompts and code snippets. The spec calls for a JetBrains-style "Darcula" IDE aesthetic, local-first SQLite storage, hybrid keyword/semantic search, and Google Drive backup.
 
-The original PRD is attached in the conversation as `PromptVault__IDE-Style_Prompt_Manager.docx`.
+The original PRD is `PromptVault__Specification_v0_1.docx`.
 
 ---
 
@@ -24,6 +24,7 @@ The original PRD is attached in the conversation as `PromptVault__IDE-Style_Prom
 | Styling | Tailwind CSS 3 | `^3.4.17` |
 | Editor | Monaco Editor | `^0.52.0` via `@monaco-editor/react ^4.6.0` |
 | Database | SQLite (rusqlite 0.31, bundled) + FTS5 | — |
+| Vector storage | `sqlite-vec = "0"` (BLOB format, extension init deferred) | — |
 | Embeddings | `@xenova/transformers ^2.17.0` (local), Gemini API, Voyage AI | — |
 | Sync | Google Drive API v3 via `reqwest 0.12` | — |
 
@@ -70,55 +71,91 @@ The original PRD is attached in the conversation as `PromptVault__IDE-Style_Prom
 - `src/components/DiffViewer.tsx`: full-screen side-by-side diff using LCS algorithm, red/green highlighting, line numbers, +/- stats
 - Inspector's History section: click any past version to open diff against current
 
+### Phase 5.1 — Persistent Embeddings (sqlite-vec)
+- **New `embeddings` table** in SQLite: one row per prompt, upserted on every (re)embed.  
+  Schema: `(prompt_id PK, vector BLOB, model TEXT, provider TEXT, dimensions INTEGER, updated_at TEXT)`
+- **BLOB format** is raw little-endian f32 bytes — wire-compatible with sqlite-vec's native `vec` type.  
+  When SQL-level similarity queries are needed (`vec_distance_cosine`), adding a `vec0` virtual table is schema-only with no data migration.
+- **`db.rs`** additions: `StoredEmbedding` struct; `floats_to_blob` / `blob_to_floats` helpers; `save_embedding(prompt_id, vector, model, provider)` (INSERT OR REPLACE); `get_all_embeddings(model_filter)` (optionally filtered by model for efficient per-provider restore)
+- **`lib.rs`** additions: `save_embedding` and `get_all_embeddings` Tauri commands, both registered
+- **`commands.ts`** additions: `saveEmbedding()` and `getAllEmbeddings()` wrappers with JSDoc
+- **`useEmbeddings.ts`** additions:
+  - `restoreIndex()`: loads stored embeddings from SQLite on startup, filters to current provider's model, populates `indexRef` — index survives app restarts without re-embedding
+  - `restoreAttempted` flag: prevents duplicate restore calls; resets on provider switch so the new provider's stored rows are loaded immediately
+  - `indexPrompts` and `indexSinglePrompt` now call `saveEmbedding` (fire-and-forget) after every successful embed
+  - `removeFromIndex` leaves DB cleanup to `ON DELETE CASCADE` — no manual delete call needed
+- **`App.tsx`**: `useEffect` fires once after prompts load to call `restoreIndex()`; also re-fires on provider change via `restoreAttempted` dependency
+
+### Phase 5.2 — OAuth Callback Server
+- **`await_oauth_callback()`** in `sync.rs`: standalone async function (not a method, so it can be called from spawned tasks)
+  - Binds `TcpListener` on `127.0.0.1:8741`; fails with a clear message if port is busy
+  - Waits up to 3 minutes (`tokio::time::timeout`) for Google's redirect
+  - Parses `?code=` / `?error=` from the raw HTTP request line
+  - Sends a polished Darcula-themed HTML response to the browser tab before returning
+- **`refresh_access_token()`** and **`ensure_fresh_token()`** added to `DriveSync`: tokens expire in 1 hour; `upload_db` now auto-refreshes before every sync
+- **`AppState.sync`** changed from `TokioMutex<DriveSync>` to `Arc<TokioMutex<DriveSync>>` so the Arc can be cloned into `tokio::spawn` tasks
+- **`start_oauth_flow(client_id, client_secret)`** Tauri command:
+  1. Saves credentials to disk
+  2. Builds and returns the Google authorization URL to the frontend
+  3. Spawns a background task that calls `await_oauth_callback()` then `exchange_code()` — the frontend never handles the code
+  4. On error, writes `SyncStatus::Error(msg)` to the persisted config so the frontend poll sees it
+- **`SyncPanel.tsx`** fully reworked as a self-contained smart component:
+  - Owns credentials form → `startOAuthFlow` → `openUrl` (shell plugin + `window.open` fallback) → polling (1.5s interval, 200s timeout) → auto-transition
+  - Three visual phases: setup form, spinning "waiting for browser" state, connected controls
+  - Disconnect clears tokens without touching credentials
+- **`App.tsx`**: `☁` button in title bar; `Escape` closes SyncPanel; passes `onOpenSync` callback to Inspector
+- **`Inspector.tsx`**: sync placeholder replaced with "Google Drive / Configure →" that opens SyncPanel
+
 ---
 
-## 4. File Inventory (36 files)
+## 4. File Inventory (37 files)
 
 ```
 Root (10 files)
-├── .gitignore                     25 lines
-├── README.md                     116 lines
-├── index.html                     18 lines
-├── package.json                   32 lines
-├── postcss.config.js               6 lines
-├── tailwind.config.js             55 lines
-├── tsconfig.json                  23 lines
-└── vite.config.ts                 25 lines
+├── .gitignore
+├── HANDOFF.md
+├── README.md
+├── index.html
+├── package.json
+├── postcss.config.js
+├── tailwind.config.js
+├── tsconfig.json
+└── vite.config.ts
 
-src/ (17 files, ~2,885 lines)
-├── main.tsx                       10 lines   Entry point
-├── App.tsx                       334 lines   Main layout, state, modals
-├── types.ts                       62 lines   Shared TS types
-├── vite-env.d.ts                   1 line
-├── styles/globals.css             82 lines   Tailwind + Darcula base
-├── api/commands.ts               111 lines   Tauri invoke wrappers + sync API
-├── hooks/useAppData.ts           422 lines   CRUD hooks, auto-save, browser fallback
-├── editor/darculaTheme.ts        140 lines   Monaco theme definition
-├── editor/MonacoEditor.tsx       187 lines   Editor wrapper
-├── embeddings/service.ts         227 lines   3-provider embed + cosine similarity
-├── embeddings/useEmbeddings.ts   196 lines   Index management hook
-├── components/Sidebar.tsx        258 lines   Folder tree + tag cloud
-├── components/EditorPanel.tsx    140 lines   Tabbed Monaco editor
-├── components/Inspector.tsx      284 lines   Metadata, versions, diff, tags, delete
-├── components/StatusBar.tsx       44 lines
-├── components/CommandPalette.tsx  234 lines   Hybrid keyword/semantic search
-├── components/NewPromptDialog.tsx 161 lines
-├── components/BrainSelector.tsx  200 lines   Embedding provider picker
-├── components/DiffViewer.tsx     212 lines   Side-by-side visual diff
-└── components/SyncPanel.tsx      173 lines   Google Drive settings
+src/ (18 files)
+├── main.tsx                        Entry point
+├── App.tsx                         Main layout, state, modals (SyncPanel wired)
+├── types.ts                        Shared TS types
+├── vite-env.d.ts
+├── styles/globals.css              Tailwind + Darcula base
+├── api/commands.ts                 Tauri invoke wrappers (+ saveEmbedding, getAllEmbeddings, startOAuthFlow)
+├── hooks/useAppData.ts             CRUD hooks, auto-save, browser fallback
+├── editor/darculaTheme.ts          Monaco theme definition
+├── editor/MonacoEditor.tsx         Editor wrapper
+├── embeddings/service.ts           3-provider embed + cosine similarity
+├── embeddings/useEmbeddings.ts     Index management + restoreIndex + SQLite persistence
+├── components/Sidebar.tsx          Folder tree + tag cloud
+├── components/EditorPanel.tsx      Tabbed Monaco editor
+├── components/Inspector.tsx        Metadata, versions, diff, tags, delete, sync link
+├── components/StatusBar.tsx
+├── components/CommandPalette.tsx   Hybrid keyword/semantic search
+├── components/NewPromptDialog.tsx
+├── components/BrainSelector.tsx    Embedding provider picker
+├── components/DiffViewer.tsx       Side-by-side visual diff
+└── components/SyncPanel.tsx        Google Drive OAuth flow (self-contained)
 
-src-tauri/ (7 files, ~1,079 lines)
-├── Cargo.toml                     23 lines
-├── build.rs                        3 lines
-├── tauri.conf.json                40 lines
-├── migrations/001_init.sql        56 lines   Reference schema
-├── src/main.rs                     6 lines   Entry
-├── src/lib.rs                    233 lines   All Tauri commands
-├── src/db.rs                     463 lines   SQLite + FTS5 + versioning
-└── src/sync.rs                   318 lines   Google Drive OAuth + upload
+src-tauri/ (7 files)
+├── Cargo.toml                      (+ sqlite-vec = "0")
+├── build.rs
+├── tauri.conf.json
+├── migrations/001_init.sql         Reference schema
+├── src/main.rs                     Entry
+├── src/lib.rs                      All Tauri commands (+ save_embedding, get_all_embeddings, start_oauth_flow)
+├── src/db.rs                       SQLite + FTS5 + versioning + embeddings table
+└── src/sync.rs                     Google Drive OAuth + callback server + token refresh
 
 scripts/ (1 file)
-└── generate_icons.py              98 lines   Icon generation (requires Pillow)
+└── generate_icons.py               Icon generation (requires Pillow)
 ```
 
 ---
@@ -126,15 +163,24 @@ scripts/ (1 file)
 ## 5. Database Schema
 
 ```sql
-categories    (id, name, parent_id, created_at)
-prompts       (id, title, category_id, created_at, updated_at)
+categories      (id, name, parent_id, created_at)
+prompts         (id, title, category_id, created_at, updated_at)
 prompt_versions (id, prompt_id, content_text, version_number, embedding_vector BLOB, created_at)
-tags          (id, name UNIQUE)
-prompt_tags   (prompt_id, tag_id)  -- composite PK
-prompts_fts   VIRTUAL TABLE USING fts5(title, content)  -- tokenize='porter unicode61'
+tags            (id, name UNIQUE)
+prompt_tags     (prompt_id, tag_id)  -- composite PK
+prompts_fts     VIRTUAL TABLE USING fts5(title, content)  -- tokenize='porter unicode61'
+
+-- Added Phase 5.1
+embeddings      (prompt_id PK → prompts.id CASCADE,
+                 vector BLOB NOT NULL,          -- raw f32 LE bytes, sqlite-vec compatible
+                 model TEXT NOT NULL,           -- e.g. "all-MiniLM-L6-v2"
+                 provider TEXT NOT NULL,        -- "local" | "gemini" | "claude"
+                 dimensions INTEGER NOT NULL,
+                 updated_at TEXT NOT NULL)
+-- Index: idx_embeddings_model ON embeddings(model)
 ```
 
-Every `update_prompt` call with new `content` creates a new `prompt_versions` row and increments `version_number`. The FTS5 index is rebuilt on each content update (delete + re-insert by rowid).
+Every `update_prompt` call with new `content` creates a new `prompt_versions` row. The FTS5 index is rebuilt on each content update. The `embeddings` table is upserted (INSERT OR REPLACE) on every embed call.
 
 ---
 
@@ -166,18 +212,24 @@ Every `update_prompt` call with new `content` creates a new `prompt_versions` ro
 ## 8. Known Limitations & Open Work
 
 ### Not yet implemented
-1. **sqlite-vec extension** — The PRD calls for `sqlite-vec` for persisting embedding vectors in SQLite. Currently embeddings are in-memory only (cleared on reload). Requires adding the `sqlite-vec` Rust crate and storing/loading vectors from the `embedding_vector BLOB` column.
-2. **Background sync worker** — `sync.rs` has upload/check methods but no periodic background task. Needs a Tauri async background thread that syncs on a timer (e.g., every 5 minutes when connected).
-3. **OAuth callback server** — `exchange_code` expects a `code` param but there's no local HTTP listener to receive the Google redirect. Needs a temporary `localhost:8741/callback` server in Rust (or use Tauri's deep-link plugin).
-4. **Merge/Override conflict UI** — The PRD specifies prompting the user to "Merge" or "Override" when the remote is newer. `check_sync_status` returns the remote modified time but no UI acts on it yet.
-5. **SQLCipher encryption** — PRD mentions optional database encryption with a master password. Not implemented.
-6. **Tauri icons** — Icons are generated via `scripts/generate_icons.py` (requires Python 3 + Pillow). Must be run locally after cloning — binary PNGs are `.gitignore`d.
+
+1. **Merge/Override conflict UI** — `check_sync_status` returns the remote modified time and `check_remote_status` is wired, but no UI prompts the user to "Merge" or "Override" when the remote is newer than `last_sync`. The PRD requires this on startup. Implementation: call `check_sync_status` in `App.tsx` after `useAppData` loads, compare timestamps, and show a modal if remote is newer.
+
+2. **Background sync worker** — `sync.rs` has upload/check methods but no periodic timer. Needs a `tokio::spawn` loop in `lib.rs` that wakes every 5 minutes, checks token freshness (`ensure_fresh_token` is already implemented), and calls `upload_db`. Gate it on `config.enabled`.
+
+3. **SQLCipher encryption** — PRD mentions optional database encryption with a master password. Not implemented. Would require swapping `rusqlite` for `rusqlite` with the `sqlcipher` feature flag and threading a password through `Database::new()`.
+
+4. **Tauri icons** — Icons are generated via `scripts/generate_icons.py` (requires Python 3 + Pillow). Must be run locally after cloning — binary PNGs are `.gitignore`d.
+
+5. **SQL-level vector similarity** (`sqlite-vec` extension init) — The `sqlite-vec` crate is in `Cargo.toml` and the BLOB format is compatible, but the extension is not yet loaded at connection time. When SQL queries like `vec_distance_cosine` are needed, add `conn.load_extension(sqlite_vec::path(), None)?` in `Database::new()` and create a `vec0` virtual table. No data migration required.
 
 ### Potential issues to watch
-- **Transformers.js Wasm loading** — First load of local embeddings downloads ~30MB model. May need a loading indicator or pre-download step.
-- **`reqwest` in Tauri** — The sync module uses `reqwest` with `async`. The `sync` field uses `tokio::sync::Mutex` (not `std::sync::Mutex`) so the guard can be held across `.await` points.
-- **Monaco + Tauri CSP** — Monaco Editor loads web workers. The `tauri.conf.json` has `"csp": null` (permissive). For production, this should be tightened.
+
+- **`tauri.conf.json` CSP** — Currently `"csp": null` (permissive) to allow Monaco web workers. Should be tightened for production.
+- **Port 8741 conflicts** — The OAuth callback listener will return a clear error if the port is in use. If this is a concern in CI or shared environments, the port could be made configurable.
+- **Transformers.js Wasm loading** — First load of local embeddings downloads ~30MB model. A loading indicator exists in BrainSelector but there is no pre-download step on first launch.
 - **FTS5 rebuild on update** — Current approach deletes and re-inserts the FTS row on every content change. At scale, consider using FTS5 content-sync tables instead.
+- **`reqwest` in Tauri** — The sync module uses `reqwest` with `async`. The `sync` field uses `Arc<tokio::sync::Mutex>` (not `std::sync::Mutex`) so the guard can be held across `.await` points and cloned into spawned tasks.
 
 ---
 
@@ -210,7 +262,19 @@ Prerequisites: Rust 1.80+, Node 20+, Tauri CLI v2, Python 3 + Pillow, platform-s
 
 ---
 
-## 10. User Preferences
+## 10. Google Drive Setup (for end users)
+
+1. Go to [console.cloud.google.com](https://console.cloud.google.com)
+2. Create a project → enable the **Google Drive API**
+3. Create an **OAuth 2.0 Client ID** (Desktop application type)
+4. Add `http://localhost:8741/callback` as an authorized redirect URI
+5. Copy the Client ID and Client Secret
+6. In PromptVault: click the **☁** button in the title bar (or "Configure →" in the Inspector's Sync section), paste the credentials, and click **Sign in with Google**
+7. Complete consent in the browser tab that opens — PromptVault will detect the callback automatically
+
+---
+
+## 11. User Preferences
 
 - User welcomes clarifying questions
 - Prefers building incrementally and committing each phase to `main`
