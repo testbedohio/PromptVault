@@ -1,26 +1,13 @@
 import { useState, useCallback, useRef, useEffect } from "react";
+import { useAppData } from "./hooks/useAppData";
+import { useEmbeddings } from "./embeddings/useEmbeddings";
 import Sidebar from "./components/Sidebar";
 import EditorPanel from "./components/EditorPanel";
 import Inspector from "./components/Inspector";
 import StatusBar from "./components/StatusBar";
 import CommandPalette from "./components/CommandPalette";
-
-interface Snippet {
-  id: number;
-  title: string;
-  content: string;
-  categoryId: number | null;
-  tags: string[];
-  createdAt: string;
-  updatedAt: string;
-}
-
-interface Category {
-  id: number;
-  name: string;
-  parentId: number | null;
-  children: Category[];
-}
+import NewPromptDialog from "./components/NewPromptDialog";
+import BrainSelector from "./components/BrainSelector";
 
 export default function App() {
   // Panel widths
@@ -28,73 +15,50 @@ export default function App() {
   const [inspectorWidth, setInspectorWidth] = useState(280);
   const [inspectorOpen, setInspectorOpen] = useState(true);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+  const [newPromptDialogOpen, setNewPromptDialogOpen] = useState(false);
+  const [brainSelectorOpen, setBrainSelectorOpen] = useState(false);
 
-  // Data state
-  const [categories, setCategories] = useState<Category[]>([
-    {
-      id: 1,
-      name: "System Prompts",
-      parentId: null,
-      children: [
-        { id: 4, name: "Assistants", parentId: 1, children: [] },
-        { id: 5, name: "Agents", parentId: 1, children: [] },
-      ],
-    },
-    { id: 2, name: "Code Snippets", parentId: null, children: [] },
-    { id: 3, name: "Templates", parentId: null, children: [] },
-  ]);
+  // Data from Tauri backend (or browser fallback)
+  const {
+    prompts,
+    categories,
+    flatCategories,
+    tags,
+    loading,
+    dbConnected,
+    tauri,
+    addPrompt,
+    savePrompt,
+    removePrompt,
+    addCategory,
+    searchPrompts,
+  } = useAppData();
 
-  const [tags] = useState<string[]>([
-    "python",
-    "javascript",
-    "sql",
-    "gpt-4",
-    "claude",
-    "chain-of-thought",
-    "few-shot",
-    "system",
-  ]);
+  // Embedding engine
+  const embeddings = useEmbeddings();
 
-  const [snippets] = useState<Snippet[]>([
-    {
-      id: 1,
-      title: "code_review_agent.md",
-      content:
-        '# Code Review Agent\n\nYou are a senior software engineer conducting a thorough code review.\n\n## Guidelines\n- Check for **security vulnerabilities**\n- Ensure proper error handling\n- Verify naming conventions\n\n```python\ndef review(code: str) -> dict:\n    """Analyze code and return findings."""\n    findings = []\n    # Analysis logic here\n    return {"findings": findings, "score": 0.85}\n```',
-      categoryId: 1,
-      tags: ["python", "claude", "system"],
-      createdAt: "2025-03-10T14:30:00Z",
-      updatedAt: "2025-03-12T09:15:00Z",
-    },
-    {
-      id: 2,
-      title: "sql_optimizer.md",
-      content:
-        "# SQL Query Optimizer\n\nAnalyze the following SQL query and suggest optimizations.\n\nFocus on:\n- Index usage\n- JOIN efficiency\n- Subquery elimination",
-      categoryId: 2,
-      tags: ["sql", "gpt-4"],
-      createdAt: "2025-03-08T10:00:00Z",
-      updatedAt: "2025-03-11T16:45:00Z",
-    },
-    {
-      id: 3,
-      title: "few_shot_classifier.md",
-      content:
-        '# Few-Shot Classification Prompt\n\nClassify the following text into one of these categories: [Bug, Feature, Question]\n\n## Examples\n- "The app crashes on login" → Bug\n- "Can we add dark mode?" → Feature\n- "How do I export data?" → Question\n\n## Input\n{user_input}',
-      categoryId: 3,
-      tags: ["few-shot", "chain-of-thought"],
-      createdAt: "2025-03-05T08:20:00Z",
-      updatedAt: "2025-03-10T11:30:00Z",
-    },
-  ]);
-
-  const [openTabs, setOpenTabs] = useState<number[]>([1]);
-  const [activeTab, setActiveTab] = useState<number>(1);
+  // Tab state
+  const [openTabs, setOpenTabs] = useState<number[]>([]);
+  const [activeTab, setActiveTab] = useState<number>(0);
   const [selectedCategory, setSelectedCategory] = useState<number | null>(null);
+  const [activeTagFilter, setActiveTagFilter] = useState<string | null>(null);
 
-  const activeSnippet = snippets.find((s) => s.id === activeTab) || null;
+  // Open first prompt when data loads
+  useEffect(() => {
+    if (prompts.length > 0 && openTabs.length === 0) {
+      setOpenTabs([prompts[0].id]);
+      setActiveTab(prompts[0].id);
+    }
+  }, [prompts]);
 
-  // Open a snippet in a tab
+  const activeSnippet = prompts.find((s) => s.id === activeTab) || null;
+
+  const filteredPrompts = prompts.filter((p) => {
+    if (selectedCategory !== null && p.category_id !== selectedCategory) return false;
+    if (activeTagFilter && !p.tags.includes(activeTagFilter)) return false;
+    return true;
+  });
+
   const openSnippet = useCallback(
     (id: number) => {
       if (!openTabs.includes(id)) {
@@ -105,7 +69,6 @@ export default function App() {
     [openTabs]
   );
 
-  // Close a tab
   const closeTab = useCallback(
     (id: number) => {
       setOpenTabs((prev) => {
@@ -117,6 +80,35 @@ export default function App() {
       });
     },
     [activeTab]
+  );
+
+  const handleNewPrompt = useCallback(
+    async (title: string, categoryId: number | null, tagList: string[]) => {
+      const prompt = await addPrompt({
+        title,
+        content: `# ${title}\n\n`,
+        category_id: categoryId,
+        tags: tagList,
+      });
+      if (prompt) {
+        openSnippet(prompt.id);
+        // Index the new prompt
+        embeddings.indexSinglePrompt(prompt);
+      }
+      setNewPromptDialogOpen(false);
+    },
+    [addPrompt, openSnippet, embeddings]
+  );
+
+  const handleDeletePrompt = useCallback(
+    async (id: number) => {
+      const ok = await removePrompt(id);
+      if (ok) {
+        closeTab(id);
+        embeddings.removeFromIndex(id);
+      }
+    },
+    [removePrompt, closeTab, embeddings]
   );
 
   // Resizable dividers
@@ -155,25 +147,49 @@ export default function App() {
     };
   }, []);
 
-  // Cmd+K shortcut
+  // Keyboard shortcuts
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key === "k") {
         e.preventDefault();
         setCommandPaletteOpen((prev) => !prev);
       }
+      if ((e.metaKey || e.ctrlKey) && e.key === "n") {
+        e.preventDefault();
+        setNewPromptDialogOpen(true);
+      }
+      if ((e.metaKey || e.ctrlKey) && e.key === "b") {
+        e.preventDefault();
+        setBrainSelectorOpen((prev) => !prev);
+      }
       if (e.key === "Escape") {
         setCommandPaletteOpen(false);
+        setNewPromptDialogOpen(false);
+        setBrainSelectorOpen(false);
       }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
   }, []);
 
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center h-screen w-screen bg-darcula-bg">
+        <div className="text-center">
+          <div className="text-4xl mb-3 animate-pulse">⬡</div>
+          <div className="font-mono text-sm text-darcula-text-muted">
+            Initializing PromptVault...
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="flex flex-col h-screen w-screen overflow-hidden bg-darcula-bg">
       {/* Title Bar */}
-      <header className="flex items-center justify-between h-9 px-4 bg-darcula-bg-light border-b border-darcula-border flex-shrink-0 select-none"
+      <header
+        className="flex items-center justify-between h-9 px-4 bg-darcula-bg-light border-b border-darcula-border flex-shrink-0 select-none"
         data-tauri-drag-region
       >
         <div className="flex items-center gap-2">
@@ -183,8 +199,27 @@ export default function App() {
           <span className="text-darcula-text-muted text-2xs font-mono">
             v1.0.0
           </span>
+          {!dbConnected && (
+            <span className="text-2xs font-mono px-1.5 py-0.5 rounded-sm bg-darcula-warning/20 text-darcula-warning">
+              browser mode
+            </span>
+          )}
         </div>
         <div className="flex items-center gap-3 text-darcula-text-muted text-xs font-mono">
+          <button
+            className="hover:text-darcula-text transition-colors"
+            onClick={() => setNewPromptDialogOpen(true)}
+            title="New Prompt (Ctrl+N)"
+          >
+            + New
+          </button>
+          <button
+            className="hover:text-darcula-text transition-colors"
+            onClick={() => setBrainSelectorOpen(true)}
+            title="Brain Selector (Ctrl+B)"
+          >
+            🧠
+          </button>
           <button
             className="hover:text-darcula-text transition-colors"
             onClick={() => setCommandPaletteOpen(true)}
@@ -204,44 +239,44 @@ export default function App() {
 
       {/* Main Content */}
       <div className="flex flex-1 overflow-hidden">
-        {/* Sidebar */}
         <div style={{ width: sidebarWidth }} className="flex-shrink-0 overflow-hidden">
           <Sidebar
             categories={categories}
             tags={tags}
-            snippets={snippets}
+            prompts={filteredPrompts}
+            allPrompts={prompts}
             selectedCategory={selectedCategory}
+            activeTagFilter={activeTagFilter}
             onSelectCategory={setSelectedCategory}
+            onSelectTag={setActiveTagFilter}
             onOpenSnippet={openSnippet}
+            onNewPrompt={() => setNewPromptDialogOpen(true)}
+            onNewCategory={addCategory}
           />
         </div>
 
-        {/* Divider */}
         <div className="panel-divider" onMouseDown={onMouseDown("sidebar")} />
 
-        {/* Editor Panel */}
         <div className="flex-1 overflow-hidden">
           <EditorPanel
-            snippets={snippets}
+            prompts={prompts}
             openTabs={openTabs}
             activeTab={activeTab}
             onSelectTab={setActiveTab}
             onCloseTab={closeTab}
+            onSave={savePrompt}
           />
         </div>
 
-        {/* Inspector */}
         {inspectorOpen && (
           <>
-            <div
-              className="panel-divider"
-              onMouseDown={onMouseDown("inspector")}
-            />
-            <div
-              style={{ width: inspectorWidth }}
-              className="flex-shrink-0 overflow-hidden"
-            >
-              <Inspector snippet={activeSnippet} />
+            <div className="panel-divider" onMouseDown={onMouseDown("inspector")} />
+            <div style={{ width: inspectorWidth }} className="flex-shrink-0 overflow-hidden">
+              <Inspector
+                snippet={activeSnippet}
+                onDelete={handleDeletePrompt}
+                onSave={savePrompt}
+              />
             </div>
           </>
         )}
@@ -249,19 +284,49 @@ export default function App() {
 
       {/* Status Bar */}
       <StatusBar
-        snippetCount={snippets.length}
+        snippetCount={prompts.length}
         activeSnippet={activeSnippet}
+        dbConnected={dbConnected}
+        tauri={tauri}
       />
 
-      {/* Command Palette */}
+      {/* Modals */}
       {commandPaletteOpen && (
         <CommandPalette
-          snippets={snippets}
+          prompts={prompts}
+          searchPrompts={searchPrompts}
+          semanticSearch={embeddings.semanticSearch}
+          semanticIndexSize={embeddings.indexSize}
           onSelect={(id) => {
             openSnippet(id);
             setCommandPaletteOpen(false);
           }}
           onClose={() => setCommandPaletteOpen(false)}
+        />
+      )}
+
+      {newPromptDialogOpen && (
+        <NewPromptDialog
+          categories={flatCategories}
+          onSubmit={handleNewPrompt}
+          onClose={() => setNewPromptDialogOpen(false)}
+        />
+      )}
+
+      {brainSelectorOpen && (
+        <BrainSelector
+          provider={embeddings.provider}
+          geminiApiKey={embeddings.geminiApiKey}
+          claudeApiKey={embeddings.claudeApiKey}
+          isIndexing={embeddings.isIndexing}
+          indexProgress={embeddings.indexProgress}
+          indexSize={embeddings.indexSize}
+          lastError={embeddings.lastError}
+          totalPrompts={prompts.length}
+          onSetProvider={embeddings.setProvider}
+          onSetApiKey={embeddings.setApiKey}
+          onReindex={() => embeddings.indexPrompts(prompts)}
+          onClose={() => setBrainSelectorOpen(false)}
         />
       )}
     </div>
