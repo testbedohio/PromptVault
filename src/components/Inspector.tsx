@@ -6,6 +6,7 @@ import type { Prompt } from "../types";
 interface InspectorProps {
   snippet: Prompt | null;
   onDelete: (id: number) => Promise<void>;
+  onOpenSync: () => void;
   onSave: (
     id: number,
     updates: { title?: string; content?: string; tags?: string[] }
@@ -60,7 +61,7 @@ function formatDate(iso: string): string {
   });
 }
 
-export default function Inspector({ snippet, onDelete, onSave }: InspectorProps) {
+export default function Inspector({ snippet, onDelete, onSave, onOpenSync }: InspectorProps) {
   const { versions, loading: versionsLoading } = useVersions(snippet?.id ?? null);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [editingTag, setEditingTag] = useState(false);
@@ -89,7 +90,8 @@ export default function Inspector({ snippet, onDelete, onSave }: InspectorProps)
 
   const wordCount = snippet.content.split(/\s+/).filter(Boolean).length;
   const charCount = snippet.content.length;
-  const lineCount = snippet.content.split("\n").length;
+  const lineCount = snippet.content.split("
+").length;
 
   const handleAddTag = async () => {
     const tag = newTag.trim().toLowerCase();
@@ -226,11 +228,19 @@ export default function Inspector({ snippet, onDelete, onSave }: InspectorProps)
 
       {/* Sync Status */}
       <Section title="Sync">
-        <div className="flex items-center gap-2">
-          <span className="w-2 h-2 rounded-full bg-darcula-text-muted" />
-          <span className="text-2xs font-mono text-darcula-text-muted">
-            Not configured (Phase 4)
-          </span>
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <span className="w-2 h-2 rounded-full bg-darcula-text-muted" />
+            <span className="text-2xs font-mono text-darcula-text-muted">
+              Google Drive
+            </span>
+          </div>
+          <button
+            className="text-2xs font-mono text-darcula-accent-bright hover:underline"
+            onClick={onOpenSync}
+          >
+            Configure →
+          </button>
         </div>
       </Section>
 
