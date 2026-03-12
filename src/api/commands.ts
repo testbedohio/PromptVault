@@ -74,7 +74,6 @@ export async function searchPrompts(query: string): Promise<Prompt[]> {
 
 // ─── Embeddings ──────────────────────────────────────────────────
 
-/** A vector embedding row loaded from the SQLite `embeddings` table. */
 export interface StoredEmbedding {
   prompt_id: number;
   vector: number[];
@@ -82,15 +81,6 @@ export interface StoredEmbedding {
   provider: string;
 }
 
-/**
- * Persist a vector embedding for a prompt.
- * Safe to call after every save — uses INSERT OR REPLACE internally.
- *
- * @param promptId  The prompt this embedding belongs to.
- * @param vector    The raw f32 embedding array from the active provider.
- * @param model     Model name, e.g. "all-MiniLM-L6-v2".
- * @param provider  Provider key: "local" | "gemini" | "claude".
- */
 export async function saveEmbedding(
   promptId: number,
   vector: number[],
@@ -100,13 +90,6 @@ export async function saveEmbedding(
   return call<boolean>("save_embedding", { promptId, vector, model, provider });
 }
 
-/**
- * Load stored embeddings from SQLite, filtered to a specific model.
- * Used on app startup to restore the in-memory index without re-embedding.
- *
- * @param model  Model name to filter by, e.g. "all-MiniLM-L6-v2".
- *               Pass an empty string to load all embeddings across all models.
- */
 export async function getAllEmbeddings(model: string = ""): Promise<StoredEmbedding[]> {
   return call<StoredEmbedding[]>("get_all_embeddings", { model });
 }
@@ -122,7 +105,42 @@ export interface SyncConfig {
   token_expiry: number | null;
   remote_file_id: string | null;
   last_sync: string | null;
-  sync_status: string;
+  sync_status: string | { Error: string };
+}
+
+export function isSyncConnected(config: SyncConfig): boolean {
+  return config.sync_status === "Connected" || config.sync_status === "Synced";
+}
+
+export function isSyncError(config: SyncConfig): boolean {
+  return (
+    typeof config.sync_status === "object" && "Error" in config.sync_status
+  );
+}
+
+export function getSyncStatusLabel(config: SyncConfig): string {
+  if (typeof config.sync_status === "object" && "Error" in config.sync_status) {
+    return `Error: ${config.sync_status.Error}`;
+  }
+  return String(config.sync_status);
+}
+
+/**
+ * Start the Google Drive OAuth 2.0 flow.
+ *
+ * Saves credentials, spawns a one-shot localhost:8741 callback listener,
+ * and returns the Google authorization URL to open in the system browser.
+ *
+ * After calling this, poll `getSyncConfig()` until sync_status is "Connected".
+ */
+export async function startOAuthFlow(
+  clientId: string,
+  clientSecret: string
+): Promise<string> {
+  return call<string>("start_oauth_flow", {
+    clientId,
+    clientSecret,
+  });
 }
 
 export async function getSyncConfig(): Promise<SyncConfig> {
