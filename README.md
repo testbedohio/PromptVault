@@ -32,7 +32,12 @@ node --version
 npm install -g @tauri-apps/cli@^2
 ```
 
-### 4. System Dependencies
+### 4. Python 3 + Pillow (for icon generation)
+```bash
+pip3 install Pillow
+```
+
+### 5. System Dependencies
 
 **macOS:** `xcode-select --install`
 
@@ -49,6 +54,10 @@ sudo apt install libwebkit2gtk-4.1-dev build-essential curl wget file \
 
 ```bash
 npm install
+
+# Generate app icons (required on first clone)
+python3 scripts/generate_icons.py
+
 npm run tauri dev
 ```
 
