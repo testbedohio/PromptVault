@@ -8,15 +8,19 @@ import StatusBar from "./components/StatusBar";
 import CommandPalette from "./components/CommandPalette";
 import NewPromptDialog from "./components/NewPromptDialog";
 import BrainSelector from "./components/BrainSelector";
+import SyncPanel from "./components/SyncPanel";
 
 export default function App() {
   // Panel widths
   const [sidebarWidth, setSidebarWidth] = useState(260);
   const [inspectorWidth, setInspectorWidth] = useState(280);
   const [inspectorOpen, setInspectorOpen] = useState(true);
+
+  // Modal state
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const [newPromptDialogOpen, setNewPromptDialogOpen] = useState(false);
   const [brainSelectorOpen, setBrainSelectorOpen] = useState(false);
+  const [syncPanelOpen, setSyncPanelOpen] = useState(false);
 
   // Data from Tauri backend (or browser fallback)
   const {
@@ -52,8 +56,7 @@ export default function App() {
   }, [prompts]);
 
   // Restore the embedding index from SQLite once prompts have loaded.
-  // This runs once on initial load and again whenever the provider changes
-  // (setProvider clears the in-memory map and resets restoreAttempted).
+  // Fires again when the provider changes (setProvider resets restoreAttempted).
   useEffect(() => {
     if (!loading && prompts.length > 0 && !embeddings.restoreAttempted) {
       embeddings.restoreIndex();
@@ -101,7 +104,6 @@ export default function App() {
       });
       if (prompt) {
         openSnippet(prompt.id);
-        // Index the new prompt (also persists to SQLite via indexSinglePrompt)
         embeddings.indexSinglePrompt(prompt);
       }
       setNewPromptDialogOpen(false);
@@ -114,7 +116,6 @@ export default function App() {
       const ok = await removePrompt(id);
       if (ok) {
         closeTab(id);
-        // Remove from in-memory index; DB row cleaned up by ON DELETE CASCADE
         embeddings.removeFromIndex(id);
       }
     },
@@ -176,6 +177,7 @@ export default function App() {
         setCommandPaletteOpen(false);
         setNewPromptDialogOpen(false);
         setBrainSelectorOpen(false);
+        setSyncPanelOpen(false);
       }
     };
     window.addEventListener("keydown", handler);
@@ -229,6 +231,13 @@ export default function App() {
             title="Brain Selector (Ctrl+B)"
           >
             🧠
+          </button>
+          <button
+            className="hover:text-darcula-text transition-colors"
+            onClick={() => setSyncPanelOpen(true)}
+            title="Google Drive Sync"
+          >
+            ☁
           </button>
           <button
             className="hover:text-darcula-text transition-colors"
@@ -286,6 +295,7 @@ export default function App() {
                 snippet={activeSnippet}
                 onDelete={handleDeletePrompt}
                 onSave={savePrompt}
+                onOpenSync={() => setSyncPanelOpen(true)}
               />
             </div>
           </>
@@ -338,6 +348,10 @@ export default function App() {
           onReindex={() => embeddings.indexPrompts(prompts)}
           onClose={() => setBrainSelectorOpen(false)}
         />
+      )}
+
+      {syncPanelOpen && (
+        <SyncPanel onClose={() => setSyncPanelOpen(false)} />
       )}
     </div>
   );
