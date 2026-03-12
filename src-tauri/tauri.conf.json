@@ -10,7 +10,6 @@
     "beforeBuildCommand": "npm run build"
   },
   "app": {
-    "title": "PromptVault",
     "windows": [
       {
         "title": "PromptVault",
