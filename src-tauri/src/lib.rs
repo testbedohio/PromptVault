@@ -4,16 +4,18 @@ mod sync;
 use db::{Database, Prompt, PromptVersion, Category, Tag, StoredEmbedding};
 use sync::{DriveSync, SyncConfig};
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex as StdMutex;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex as TokioMutex;
 use tauri::State;
 
-/// Shared database state managed by Tauri.
-/// `db` uses std::sync::Mutex (only accessed in synchronous commands).
-/// `sync` uses tokio::sync::Mutex (accessed in async commands with .await).
+/// Shared application state managed by Tauri.
+///
+/// `db`   — std::sync::Mutex  (synchronous commands only, never held across .await)
+/// `sync` — Arc<tokio::sync::Mutex> so the Arc can be cloned into spawned tasks
+///          (e.g. the OAuth background listener) without requiring 'static lifetime tricks.
 struct AppState {
     db: StdMutex<Database>,
-    sync: TokioMutex<DriveSync>,
+    sync: Arc<TokioMutex<DriveSync>>,
 }
 
 // ─── Response Wrappers ───────────────────────────────────────────
@@ -145,15 +147,7 @@ fn search_prompts(query: String, state: State<AppState>) -> ApiResult<Vec<Prompt
 }
 
 // ─── Embedding Commands ──────────────────────────────────────────
-// These bridge the JS embedding engine to persistent SQLite storage.
-// Embeddings are generated in the frontend (Transformers.js / Gemini / Voyage)
-// and persisted here so the semantic search index survives app restarts.
 
-/// Persist a vector embedding for a prompt.
-/// `vector` is the f32 array from the JS embedding engine.
-/// `model` is e.g. "all-MiniLM-L6-v2", "text-embedding-004", "voyage-3-lite".
-/// `provider` is "local" | "gemini" | "claude".
-/// Uses INSERT OR REPLACE — safe to call after every save or re-embed.
 #[tauri::command]
 fn save_embedding(
     prompt_id: i64,
@@ -168,9 +162,6 @@ fn save_embedding(
     }
 }
 
-/// Load all stored embeddings, optionally filtered to a specific model name.
-/// Called on startup to restore the in-memory index without re-embedding.
-/// Pass an empty string to load all embeddings regardless of model.
 #[tauri::command]
 fn get_all_embeddings(model: String, state: State<AppState>) -> ApiResult<Vec<StoredEmbedding>> {
     let filter = if model.is_empty() { None } else { Some(model.as_str()) };
@@ -181,7 +172,66 @@ fn get_all_embeddings(model: String, state: State<AppState>) -> ApiResult<Vec<St
 }
 
 // ─── Sync Commands ───────────────────────────────────────────────
-// These use tokio::sync::Mutex so the guard can be held across .await
+
+/// Start the full Google Drive OAuth 2.0 flow.
+///
+/// 1. Saves the provided credentials to disk.
+/// 2. Builds and returns the Google authorization URL (so the frontend can open
+///    it in the system browser).
+/// 3. Spawns a background task that binds localhost:8741, waits for the Google
+///    redirect (up to 3 minutes), extracts the code, exchanges it for tokens,
+///    and persists the Connected state — all without any further frontend input.
+///
+/// The frontend should poll `get_sync_config` after calling this command until
+/// `sync_status` changes from Disconnected to Connected (or Error).
+#[tauri::command]
+async fn start_oauth_flow(
+    client_id: String,
+    client_secret: String,
+    state: State<'_, AppState>,
+) -> Result<ApiResult<String>, ()> {
+    // Save credentials and build auth URL
+    let auth_url = {
+        let mut sync = state.sync.lock().await;
+        let mut config = sync.get_config().clone();
+        config.client_id = client_id;
+        config.client_secret = client_secret;
+        if let Err(e) = sync.update_config(config) {
+            return Ok(err(&e));
+        }
+        match sync.get_auth_url() {
+            Ok(url) => url,
+            Err(e) => return Ok(err(&e)),
+        }
+    };
+
+    // Clone the Arc so the spawned task can access DriveSync independently
+    let sync_arc = Arc::clone(&state.sync);
+
+    tokio::spawn(async move {
+        match sync::await_oauth_callback().await {
+            Ok(code) => {
+                let mut sync = sync_arc.lock().await;
+                if let Err(e) = sync.exchange_code(&code).await {
+                    // Persist error state so the frontend poll sees it
+                    let mut config = sync.get_config().clone();
+                    config.sync_status = sync::SyncStatus::Error(e.clone());
+                    sync.update_config(config).ok();
+                    eprintln!("[PromptVault] OAuth exchange failed: {}", e);
+                }
+            }
+            Err(e) => {
+                let mut sync = sync_arc.lock().await;
+                let mut config = sync.get_config().clone();
+                config.sync_status = sync::SyncStatus::Error(e.clone());
+                sync.update_config(config).ok();
+                eprintln!("[PromptVault] OAuth callback error: {}", e);
+            }
+        }
+    });
+
+    Ok(ok(auth_url))
+}
 
 #[tauri::command]
 async fn get_sync_config(state: State<'_, AppState>) -> Result<ApiResult<SyncConfig>, ()> {
@@ -248,7 +298,7 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .manage(AppState {
             db: StdMutex::new(db),
-            sync: TokioMutex::new(sync),
+            sync: Arc::new(TokioMutex::new(sync)),
         })
         .invoke_handler(tauri::generate_handler![
             get_categories,
@@ -263,6 +313,7 @@ pub fn run() {
             search_prompts,
             save_embedding,
             get_all_embeddings,
+            start_oauth_flow,
             get_sync_config,
             update_sync_config,
             get_auth_url,
