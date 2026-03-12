@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useVersions } from "../hooks/useAppData";
+import DiffViewer from "./DiffViewer";
 import type { Prompt } from "../types";
 
 interface InspectorProps {
@@ -64,6 +65,12 @@ export default function Inspector({ snippet, onDelete, onSave }: InspectorProps)
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [editingTag, setEditingTag] = useState(false);
   const [newTag, setNewTag] = useState("");
+  const [diffView, setDiffView] = useState<{
+    oldText: string;
+    newText: string;
+    oldLabel: string;
+    newLabel: string;
+  } | null>(null);
 
   if (!snippet) {
     return (
@@ -179,6 +186,16 @@ export default function Inspector({ snippet, onDelete, onSave }: InspectorProps)
               <div
                 key={v.id}
                 className="flex items-center gap-2 py-1 px-1 rounded-sm hover:bg-darcula-bg-lighter cursor-pointer transition-colors"
+                onClick={() => {
+                  if (i === 0 || versions.length < 2) return;
+                  setDiffView({
+                    oldText: v.content_text,
+                    newText: versions[0].content_text,
+                    oldLabel: `v${v.version_number} — ${new Date(v.created_at).toLocaleDateString()}`,
+                    newLabel: `v${versions[0].version_number} (Current)`,
+                  });
+                }}
+                title={i === 0 ? "Current version" : "Click to compare with current"}
               >
                 <span className="text-2xs font-mono text-darcula-number w-5">
                   v{v.version_number}
@@ -186,6 +203,11 @@ export default function Inspector({ snippet, onDelete, onSave }: InspectorProps)
                 <span className="text-2xs font-mono text-darcula-text truncate flex-1">
                   {i === 0 ? "Current" : `Version ${v.version_number}`}
                 </span>
+                {i > 0 && (
+                  <span className="text-2xs font-mono text-darcula-accent-bright">
+                    diff
+                  </span>
+                )}
                 <span className="text-2xs font-mono text-darcula-text-muted">
                   {new Date(v.created_at).toLocaleDateString("en-US", {
                     month: "short",
@@ -246,6 +268,17 @@ export default function Inspector({ snippet, onDelete, onSave }: InspectorProps)
           </button>
         )}
       </Section>
+
+      {/* Diff Viewer (full-screen overlay) */}
+      {diffView && (
+        <DiffViewer
+          oldText={diffView.oldText}
+          newText={diffView.newText}
+          oldLabel={diffView.oldLabel}
+          newLabel={diffView.newLabel}
+          onClose={() => setDiffView(null)}
+        />
+      )}
     </div>
   );
 }
