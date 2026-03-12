@@ -2,15 +2,18 @@ mod db;
 mod sync;
 
 use db::{Database, Prompt, PromptVersion, Category, Tag};
-use sync::{DriveSync, SyncConfig, SyncStatus};
+use sync::{DriveSync, SyncConfig};
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
+use std::sync::Mutex as StdMutex;
+use tokio::sync::Mutex as TokioMutex;
 use tauri::State;
 
-/// Shared database state managed by Tauri
+/// Shared database state managed by Tauri.
+/// `db` uses std::sync::Mutex (only accessed in synchronous commands).
+/// `sync` uses tokio::sync::Mutex (accessed in async commands with .await).
 struct AppState {
-    db: Mutex<Database>,
-    sync: Mutex<DriveSync>,
+    db: StdMutex<Database>,
+    sync: TokioMutex<DriveSync>,
 }
 
 // ─── Response Wrappers ───────────────────────────────────────────
@@ -142,34 +145,35 @@ fn search_prompts(query: String, state: State<AppState>) -> ApiResult<Vec<Prompt
 }
 
 // ─── Sync Commands ───────────────────────────────────────────────
+// These use tokio::sync::Mutex so the guard can be held across .await
 
 #[tauri::command]
-fn get_sync_config(state: State<AppState>) -> ApiResult<SyncConfig> {
-    let sync = state.sync.lock().unwrap();
-    ok(sync.get_config().clone())
+async fn get_sync_config(state: State<'_, AppState>) -> Result<ApiResult<SyncConfig>, ()> {
+    let sync = state.sync.lock().await;
+    Ok(ok(sync.get_config().clone()))
 }
 
 #[tauri::command]
-fn update_sync_config(config: SyncConfig, state: State<AppState>) -> ApiResult<bool> {
-    let mut sync = state.sync.lock().unwrap();
+async fn update_sync_config(config: SyncConfig, state: State<'_, AppState>) -> Result<ApiResult<bool>, ()> {
+    let mut sync = state.sync.lock().await;
     match sync.update_config(config) {
-        Ok(_) => ok(true),
-        Err(e) => err(&e),
+        Ok(_) => Ok(ok(true)),
+        Err(e) => Ok(err(&e)),
     }
 }
 
 #[tauri::command]
-fn get_auth_url(state: State<AppState>) -> ApiResult<String> {
-    let sync = state.sync.lock().unwrap();
+async fn get_auth_url(state: State<'_, AppState>) -> Result<ApiResult<String>, ()> {
+    let sync = state.sync.lock().await;
     match sync.get_auth_url() {
-        Ok(url) => ok(url),
-        Err(e) => err(&e),
+        Ok(url) => Ok(ok(url)),
+        Err(e) => Ok(err(&e)),
     }
 }
 
 #[tauri::command]
 async fn exchange_auth_code(code: String, state: State<'_, AppState>) -> Result<ApiResult<bool>, ()> {
-    let mut sync = state.sync.lock().unwrap();
+    let mut sync = state.sync.lock().await;
     match sync.exchange_code(&code).await {
         Ok(_) => Ok(ok(true)),
         Err(e) => Ok(err(&e)),
@@ -182,7 +186,7 @@ async fn sync_to_drive(state: State<'_, AppState>) -> Result<ApiResult<bool>, ()
         let db = state.db.lock().unwrap();
         db.get_db_path()
     };
-    let mut sync = state.sync.lock().unwrap();
+    let mut sync = state.sync.lock().await;
     match sync.upload_db(&db_path).await {
         Ok(_) => Ok(ok(true)),
         Err(e) => Ok(err(&e)),
@@ -191,7 +195,7 @@ async fn sync_to_drive(state: State<'_, AppState>) -> Result<ApiResult<bool>, ()
 
 #[tauri::command]
 async fn check_sync_status(state: State<'_, AppState>) -> Result<ApiResult<Option<String>>, ()> {
-    let sync = state.sync.lock().unwrap();
+    let sync = state.sync.lock().await;
     match sync.check_remote_status().await {
         Ok(modified) => Ok(ok(modified)),
         Err(e) => Ok(err(&e)),
@@ -207,8 +211,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .manage(AppState {
-            db: Mutex::new(db),
-            sync: Mutex::new(sync),
+            db: StdMutex::new(db),
+            sync: TokioMutex::new(sync),
         })
         .invoke_handler(tauri::generate_handler![
             get_categories,
