@@ -1,21 +1,17 @@
-interface Snippet {
-  id: number;
-  title: string;
-  content: string;
-  categoryId: number | null;
-  tags: string[];
-  createdAt: string;
-  updatedAt: string;
-}
+import type { Prompt } from "../types";
 
 interface StatusBarProps {
   snippetCount: number;
-  activeSnippet: Snippet | null;
+  activeSnippet: Prompt | null;
+  dbConnected: boolean;
+  tauri: boolean;
 }
 
 export default function StatusBar({
   snippetCount,
   activeSnippet,
+  dbConnected,
+  tauri,
 }: StatusBarProps) {
   const lineCount = activeSnippet
     ? activeSnippet.content.split("\n").length
@@ -31,10 +27,16 @@ export default function StatusBar({
         )}
       </div>
       <div className="flex items-center gap-3">
-        <span className="opacity-70">SQLite: Connected</span>
+        <span className="opacity-70">
+          SQLite: {dbConnected ? "Connected" : "Sample Data"}
+        </span>
         <span className="flex items-center gap-1">
-          <span className="w-1.5 h-1.5 rounded-full bg-darcula-success" />
-          Local
+          <span
+            className={`w-1.5 h-1.5 rounded-full ${
+              dbConnected ? "bg-darcula-success" : "bg-darcula-warning"
+            }`}
+          />
+          {tauri ? "Desktop" : "Browser"}
         </span>
       </div>
     </footer>
