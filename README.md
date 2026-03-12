@@ -1,42 +1,40 @@
 # PromptVault
 
-A cross-platform desktop application for organizing, searching, and version-controlling LLM prompts and code snippets. Built with Tauri v2, React 19, and SQLite.
+A cross-platform desktop application for organizing, searching, and version-controlling LLM prompts and code snippets. Built with Tauri v2, React 19, TypeScript, Monaco Editor, and SQLite.
+
+## Features
+
+- **IDE-Style Interface** — 3-pane layout (Sidebar, Editor, Inspector) with JetBrains Darcula theme
+- **Monaco Editor** — Full VS Code editing engine with syntax highlighting, bracket matching, and minimap
+- **Version History** — Every save creates a version; side-by-side visual diff comparison (red/green)
+- **Hybrid Search** — FTS5 keyword search + semantic search via embeddings
+- **Brain Selector** — Toggle between Local (Transformers.js), Google Gemini, or Voyage AI embeddings
+- **Google Drive Sync** — OAuth 2.0 backup to Drive's hidden appDataFolder
+- **Command Palette** — `Ctrl+K` to search across all prompts with Tab to toggle keyword/semantic mode
+- **Local-First** — Fully functional offline; SQLite database with WAL mode
 
 ## Prerequisites
 
-Before you begin, make sure you have these installed:
-
 ### 1. Rust (1.80+)
 ```bash
-# Install Rust via rustup
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# Verify
 rustc --version
 ```
 
 ### 2. Node.js (20+)
 ```bash
-# Using nvm (recommended)
-nvm install 20
-nvm use 20
-
-# Verify
+nvm install 20 && nvm use 20
 node --version
 ```
 
 ### 3. Tauri CLI
 ```bash
-# Install the Tauri CLI
 npm install -g @tauri-apps/cli@^2
 ```
 
 ### 4. System Dependencies
 
-**macOS:**
-```bash
-xcode-select --install
-```
+**macOS:** `xcode-select --install`
 
 **Ubuntu/Debian:**
 ```bash
@@ -45,62 +43,74 @@ sudo apt install libwebkit2gtk-4.1-dev build-essential curl wget file \
   libssl-dev libayatana-appindicator3-dev librsvg2-dev
 ```
 
-**Windows:**
-- Install [Visual Studio C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
-- Install [WebView2](https://developer.microsoft.com/en-us/microsoft-edge/webview2/) (usually pre-installed on Windows 10/11)
+**Windows:** Install [Visual Studio C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) and [WebView2](https://developer.microsoft.com/en-us/microsoft-edge/webview2/)
 
 ## Getting Started
 
 ```bash
-# Install frontend dependencies
 npm install
-
-# Run in development mode (launches both Vite + Tauri)
 npm run tauri dev
-
-# Build for production
-npm run tauri build
 ```
+
+## Keyboard Shortcuts
+
+| Shortcut | Action |
+|----------|--------|
+| `Ctrl+K` | Command Palette |
+| `Ctrl+N` | New Prompt |
+| `Ctrl+B` | Brain Selector |
+| `Ctrl+S` | Force Save |
+| `Tab` (in palette) | Toggle keyword/semantic search |
+| `Esc` | Close modal |
 
 ## Project Structure
 
 ```
 PromptVault/
-├── src/                    # React frontend
-│   ├── components/         # UI components
-│   │   ├── Sidebar.tsx     # Folder tree + tag cloud
-│   │   ├── EditorPanel.tsx # Tabbed editor (Monaco in Phase 2)
-│   │   ├── Inspector.tsx   # Metadata + history + sync status
-│   │   ├── StatusBar.tsx   # Bottom status bar
-│   │   └── CommandPalette.tsx  # Cmd+K search modal
-│   ├── styles/globals.css  # Tailwind + Darcula theme
-│   ├── App.tsx             # Main layout (3-pane)
-│   └── main.tsx            # React entry point
-├── src-tauri/              # Rust backend
+├── src/                        # React frontend
+│   ├── api/commands.ts         # Tauri invoke API layer
+│   ├── components/
+│   │   ├── Sidebar.tsx         # Folder tree + tag cloud
+│   │   ├── EditorPanel.tsx     # Tabbed Monaco editor
+│   │   ├── Inspector.tsx       # Metadata, history, tags, diff, actions
+│   │   ├── StatusBar.tsx       # Bottom status bar
+│   │   ├── CommandPalette.tsx  # Hybrid keyword/semantic search
+│   │   ├── NewPromptDialog.tsx # Create prompt modal
+│   │   ├── BrainSelector.tsx   # Embedding provider selector
+│   │   ├── DiffViewer.tsx      # Side-by-side visual diff
+│   │   └── SyncPanel.tsx       # Google Drive sync settings
+│   ├── editor/
+│   │   ├── MonacoEditor.tsx    # Monaco wrapper with Darcula theme
+│   │   └── darculaTheme.ts     # JetBrains color definitions
+│   ├── embeddings/
+│   │   ├── service.ts          # Local/Gemini/Voyage embedding providers
+│   │   └── useEmbeddings.ts    # React hook for indexing and search
+│   ├── hooks/useAppData.ts     # Data hooks, CRUD, auto-save
+│   ├── types.ts                # Shared TypeScript types
+│   ├── App.tsx                 # Main layout
+│   └── main.tsx                # Entry point
+├── src-tauri/                  # Rust backend
 │   ├── src/
-│   │   ├── main.rs         # Tauri entry
-│   │   ├── lib.rs          # Commands (CRUD API)
-│   │   └── db.rs           # SQLite database layer
-│   ├── migrations/
-│   │   └── 001_init.sql    # Schema reference
-│   ├── Cargo.toml          # Rust dependencies
-│   └── tauri.conf.json     # Tauri v2 configuration
-├── tailwind.config.js      # Darcula color palette
-├── vite.config.ts          # Vite + Tauri settings
-└── package.json            # Frontend dependencies
+│   │   ├── main.rs             # Tauri entry
+│   │   ├── lib.rs              # Commands (CRUD, search, sync)
+│   │   ├── db.rs               # SQLite with FTS5
+│   │   └── sync.rs             # Google Drive OAuth + upload
+│   ├── migrations/001_init.sql
+│   ├── Cargo.toml
+│   └── tauri.conf.json
+├── tailwind.config.js          # Darcula palette
+├── vite.config.ts
+└── package.json
 ```
 
-## Phase 1 (Current)
-- [x] Tauri v2 + React 19 + Vite boilerplate
-- [x] Tailwind CSS with JetBrains Darcula color palette
-- [x] SQLite database with schema initialization
-- [x] 3-pane layout (Sidebar / Editor / Inspector)
-- [x] Command Palette (Ctrl+K)
-- [x] Resizable panel dividers
-- [x] FTS5 full-text search index
-- [x] Version tracking on every save
+## Tech Stack
 
-## Upcoming Phases
-- **Phase 2:** Monaco Editor, folder/tag navigation from DB, live save with versioning
-- **Phase 3:** sqlite-vec embeddings, semantic search, Brain selector (Local/Cloud)
-- **Phase 4:** Google Drive OAuth sync, visual diff UI, background sync worker
+| Layer | Technology |
+|-------|-----------|
+| Shell | Tauri v2 (Rust) |
+| Frontend | React 19 + TypeScript + Vite |
+| Styling | Tailwind CSS (Darcula theme) |
+| Editor | Monaco Editor |
+| Database | SQLite + FTS5 |
+| Embeddings | Transformers.js (local) / Gemini / Voyage AI |
+| Sync | Google Drive API v3 (OAuth 2.0) |
