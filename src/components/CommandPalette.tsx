@@ -1,54 +1,70 @@
 import { useState, useRef, useEffect } from "react";
-
-interface Snippet {
-  id: number;
-  title: string;
-  content: string;
-  categoryId: number | null;
-  tags: string[];
-  createdAt: string;
-  updatedAt: string;
-}
+import type { Prompt } from "../types";
 
 interface CommandPaletteProps {
-  snippets: Snippet[];
+  prompts: Prompt[];
+  searchPrompts: (query: string) => Promise<Prompt[]>;
   onSelect: (id: number) => void;
   onClose: () => void;
 }
 
 export default function CommandPalette({
-  snippets,
+  prompts,
+  searchPrompts,
   onSelect,
   onClose,
 }: CommandPaletteProps) {
   const [query, setQuery] = useState("");
+  const [results, setResults] = useState<Prompt[]>(prompts);
   const [selectedIndex, setSelectedIndex] = useState(0);
+  const [searching, setSearching] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     inputRef.current?.focus();
   }, []);
 
-  const filtered = snippets.filter(
-    (s) =>
-      s.title.toLowerCase().includes(query.toLowerCase()) ||
-      s.content.toLowerCase().includes(query.toLowerCase()) ||
-      s.tags.some((t) => t.toLowerCase().includes(query.toLowerCase()))
-  );
-
+  // Search on query change
   useEffect(() => {
-    setSelectedIndex(0);
-  }, [query]);
+    if (!query.trim()) {
+      setResults(prompts);
+      setSelectedIndex(0);
+      return;
+    }
+
+    setSearching(true);
+    const timer = setTimeout(async () => {
+      try {
+        const found = await searchPrompts(query);
+        setResults(found);
+      } catch {
+        // Fallback to client filter
+        const q = query.toLowerCase();
+        setResults(
+          prompts.filter(
+            (s) =>
+              s.title.toLowerCase().includes(q) ||
+              s.content.toLowerCase().includes(q) ||
+              s.tags.some((t) => t.toLowerCase().includes(q))
+          )
+        );
+      }
+      setSelectedIndex(0);
+      setSearching(false);
+    }, 150);
+
+    return () => clearTimeout(timer);
+  }, [query, prompts, searchPrompts]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "ArrowDown") {
       e.preventDefault();
-      setSelectedIndex((i) => Math.min(i + 1, filtered.length - 1));
+      setSelectedIndex((i) => Math.min(i + 1, results.length - 1));
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
       setSelectedIndex((i) => Math.max(i - 1, 0));
-    } else if (e.key === "Enter" && filtered[selectedIndex]) {
-      onSelect(filtered[selectedIndex].id);
+    } else if (e.key === "Enter" && results[selectedIndex]) {
+      onSelect(results[selectedIndex].id);
     }
   };
 
@@ -57,10 +73,8 @@ export default function CommandPalette({
       className="fixed inset-0 z-50 flex items-start justify-center pt-[15vh]"
       onClick={onClose}
     >
-      {/* Backdrop */}
       <div className="absolute inset-0 bg-black/50" />
 
-      {/* Palette */}
       <div
         className="relative w-full max-w-lg bg-darcula-bg-light border border-darcula-border rounded-lg shadow-2xl overflow-hidden"
         onClick={(e) => e.stopPropagation()}
@@ -77,6 +91,11 @@ export default function CommandPalette({
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={handleKeyDown}
           />
+          {searching && (
+            <span className="text-2xs text-darcula-warning font-mono animate-pulse">
+              ...
+            </span>
+          )}
           <kbd className="text-2xs font-mono text-darcula-text-muted bg-darcula-bg px-1.5 py-0.5 rounded">
             ESC
           </kbd>
@@ -84,12 +103,12 @@ export default function CommandPalette({
 
         {/* Results */}
         <div className="max-h-[300px] overflow-y-auto">
-          {filtered.length === 0 ? (
+          {results.length === 0 ? (
             <div className="px-4 py-6 text-center text-sm font-mono text-darcula-text-muted">
               No results found
             </div>
           ) : (
-            filtered.map((snippet, i) => (
+            results.map((snippet, i) => (
               <div
                 key={snippet.id}
                 className={`flex items-center gap-3 px-4 py-2.5 cursor-pointer transition-colors ${
@@ -135,6 +154,7 @@ export default function CommandPalette({
           <span>
             <kbd className="bg-darcula-bg px-1 rounded">esc</kbd> close
           </span>
+          <span className="ml-auto">{results.length} results</span>
         </div>
       </div>
     </div>
