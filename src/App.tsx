@@ -51,6 +51,15 @@ export default function App() {
     }
   }, [prompts]);
 
+  // Restore the embedding index from SQLite once prompts have loaded.
+  // This runs once on initial load and again whenever the provider changes
+  // (setProvider clears the in-memory map and resets restoreAttempted).
+  useEffect(() => {
+    if (!loading && prompts.length > 0 && !embeddings.restoreAttempted) {
+      embeddings.restoreIndex();
+    }
+  }, [loading, prompts.length, embeddings.restoreAttempted, embeddings.restoreIndex]);
+
   const activeSnippet = prompts.find((s) => s.id === activeTab) || null;
 
   const filteredPrompts = prompts.filter((p) => {
@@ -92,7 +101,7 @@ export default function App() {
       });
       if (prompt) {
         openSnippet(prompt.id);
-        // Index the new prompt
+        // Index the new prompt (also persists to SQLite via indexSinglePrompt)
         embeddings.indexSinglePrompt(prompt);
       }
       setNewPromptDialogOpen(false);
@@ -105,6 +114,7 @@ export default function App() {
       const ok = await removePrompt(id);
       if (ok) {
         closeTab(id);
+        // Remove from in-memory index; DB row cleaned up by ON DELETE CASCADE
         embeddings.removeFromIndex(id);
       }
     },
