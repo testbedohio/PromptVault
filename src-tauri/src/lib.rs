@@ -1,6 +1,8 @@
 mod db;
+mod sync;
 
 use db::{Database, Prompt, PromptVersion, Category, Tag};
+use sync::{DriveSync, SyncConfig, SyncStatus};
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use tauri::State;
@@ -8,6 +10,7 @@ use tauri::State;
 /// Shared database state managed by Tauri
 struct AppState {
     db: Mutex<Database>,
+    sync: Mutex<DriveSync>,
 }
 
 // ─── Response Wrappers ───────────────────────────────────────────
@@ -138,15 +141,74 @@ fn search_prompts(query: String, state: State<AppState>) -> ApiResult<Vec<Prompt
     }
 }
 
+// ─── Sync Commands ───────────────────────────────────────────────
+
+#[tauri::command]
+fn get_sync_config(state: State<AppState>) -> ApiResult<SyncConfig> {
+    let sync = state.sync.lock().unwrap();
+    ok(sync.get_config().clone())
+}
+
+#[tauri::command]
+fn update_sync_config(config: SyncConfig, state: State<AppState>) -> ApiResult<bool> {
+    let mut sync = state.sync.lock().unwrap();
+    match sync.update_config(config) {
+        Ok(_) => ok(true),
+        Err(e) => err(&e),
+    }
+}
+
+#[tauri::command]
+fn get_auth_url(state: State<AppState>) -> ApiResult<String> {
+    let sync = state.sync.lock().unwrap();
+    match sync.get_auth_url() {
+        Ok(url) => ok(url),
+        Err(e) => err(&e),
+    }
+}
+
+#[tauri::command]
+async fn exchange_auth_code(code: String, state: State<'_, AppState>) -> Result<ApiResult<bool>, ()> {
+    let mut sync = state.sync.lock().unwrap();
+    match sync.exchange_code(&code).await {
+        Ok(_) => Ok(ok(true)),
+        Err(e) => Ok(err(&e)),
+    }
+}
+
+#[tauri::command]
+async fn sync_to_drive(state: State<'_, AppState>) -> Result<ApiResult<bool>, ()> {
+    let db_path = {
+        let db = state.db.lock().unwrap();
+        db.get_db_path()
+    };
+    let mut sync = state.sync.lock().unwrap();
+    match sync.upload_db(&db_path).await {
+        Ok(_) => Ok(ok(true)),
+        Err(e) => Ok(err(&e)),
+    }
+}
+
+#[tauri::command]
+async fn check_sync_status(state: State<'_, AppState>) -> Result<ApiResult<Option<String>>, ()> {
+    let sync = state.sync.lock().unwrap();
+    match sync.check_remote_status().await {
+        Ok(modified) => Ok(ok(modified)),
+        Err(e) => Ok(err(&e)),
+    }
+}
+
 // ─── App Entry ───────────────────────────────────────────────────
 
 pub fn run() {
     let db = Database::new().expect("Failed to initialize database");
+    let sync = DriveSync::new();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .manage(AppState {
             db: Mutex::new(db),
+            sync: Mutex::new(sync),
         })
         .invoke_handler(tauri::generate_handler![
             get_categories,
@@ -159,6 +221,12 @@ pub fn run() {
             get_prompt_versions,
             get_all_tags,
             search_prompts,
+            get_sync_config,
+            update_sync_config,
+            get_auth_url,
+            exchange_auth_code,
+            sync_to_drive,
+            check_sync_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running PromptVault");
