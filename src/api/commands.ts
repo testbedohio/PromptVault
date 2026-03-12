@@ -72,6 +72,45 @@ export async function searchPrompts(query: string): Promise<Prompt[]> {
   return call<Prompt[]>("search_prompts", { query });
 }
 
+// ─── Embeddings ──────────────────────────────────────────────────
+
+/** A vector embedding row loaded from the SQLite `embeddings` table. */
+export interface StoredEmbedding {
+  prompt_id: number;
+  vector: number[];
+  model: string;
+  provider: string;
+}
+
+/**
+ * Persist a vector embedding for a prompt.
+ * Safe to call after every save — uses INSERT OR REPLACE internally.
+ *
+ * @param promptId  The prompt this embedding belongs to.
+ * @param vector    The raw f32 embedding array from the active provider.
+ * @param model     Model name, e.g. "all-MiniLM-L6-v2".
+ * @param provider  Provider key: "local" | "gemini" | "claude".
+ */
+export async function saveEmbedding(
+  promptId: number,
+  vector: number[],
+  model: string,
+  provider: string
+): Promise<boolean> {
+  return call<boolean>("save_embedding", { promptId, vector, model, provider });
+}
+
+/**
+ * Load stored embeddings from SQLite, filtered to a specific model.
+ * Used on app startup to restore the in-memory index without re-embedding.
+ *
+ * @param model  Model name to filter by, e.g. "all-MiniLM-L6-v2".
+ *               Pass an empty string to load all embeddings across all models.
+ */
+export async function getAllEmbeddings(model: string = ""): Promise<StoredEmbedding[]> {
+  return call<StoredEmbedding[]>("get_all_embeddings", { model });
+}
+
 // ─── Sync ────────────────────────────────────────────────────────
 
 export interface SyncConfig {
