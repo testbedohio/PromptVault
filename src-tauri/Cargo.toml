@@ -21,3 +21,8 @@ uuid = { version = "1", features = ["v4"] }
 dirs = "5"
 reqwest = { version = "0.12", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
+# sqlite-vec: compiled-in vector extension for SQLite.
+# Crate is present for future SQL-level vec queries (vec_distance_cosine, etc.).
+# Extension init is deferred to Phase 5 when we add SQL similarity search.
+# Raw f32 BLOB storage used now is wire-compatible with sqlite-vec's format.
+sqlite-vec = "0"
