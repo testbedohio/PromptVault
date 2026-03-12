@@ -116,6 +116,9 @@ src-tauri/ (7 files, ~1,079 lines)
 ├── src/lib.rs                    233 lines   All Tauri commands
 ├── src/db.rs                     463 lines   SQLite + FTS5 + versioning
 └── src/sync.rs                   318 lines   Google Drive OAuth + upload
+
+scripts/ (1 file)
+└── generate_icons.py              98 lines   Icon generation (requires Pillow)
 ```
 
 ---
@@ -168,11 +171,11 @@ Every `update_prompt` call with new `content` creates a new `prompt_versions` ro
 3. **OAuth callback server** — `exchange_code` expects a `code` param but there's no local HTTP listener to receive the Google redirect. Needs a temporary `localhost:8741/callback` server in Rust (or use Tauri's deep-link plugin).
 4. **Merge/Override conflict UI** — The PRD specifies prompting the user to "Merge" or "Override" when the remote is newer. `check_sync_status` returns the remote modified time but no UI acts on it yet.
 5. **SQLCipher encryption** — PRD mentions optional database encryption with a master password. Not implemented.
-6. **Tauri icons** — The `src-tauri/icons/` directory is empty. Need to generate platform icons (`.icns`, `.ico`, PNGs).
+6. **Tauri icons** — Icons are generated via `scripts/generate_icons.py` (requires Python 3 + Pillow). Must be run locally after cloning — binary PNGs are `.gitignore`d.
 
 ### Potential issues to watch
 - **Transformers.js Wasm loading** — First load of local embeddings downloads ~30MB model. May need a loading indicator or pre-download step.
-- **`reqwest` in Tauri** — The sync module uses `reqwest` with `async`. Tauri v2 commands marked `async` work, but the `Mutex<DriveSync>` pattern may cause deadlocks under heavy concurrent use. Consider switching to `tokio::sync::Mutex` if issues arise.
+- **`reqwest` in Tauri** — The sync module uses `reqwest` with `async`. The `sync` field uses `tokio::sync::Mutex` (not `std::sync::Mutex`) so the guard can be held across `.await` points.
 - **Monaco + Tauri CSP** — Monaco Editor loads web workers. The `tauri.conf.json` has `"csp": null` (permissive). For production, this should be tightened.
 - **FTS5 rebuild on update** — Current approach deletes and re-inserts the FTS row on every content change. At scale, consider using FTS5 content-sync tables instead.
 
@@ -188,6 +191,10 @@ cd PromptVault
 # Install frontend deps
 npm install
 
+# Install Pillow and generate app icons (required on first clone)
+pip3 install Pillow
+python3 scripts/generate_icons.py
+
 # Dev mode (Tauri + Vite hot reload)
 npm run tauri dev
 
@@ -199,7 +206,7 @@ npm run dev
 npm run tauri build
 ```
 
-Prerequisites: Rust 1.80+, Node 20+, Tauri CLI v2, platform-specific C/WebKit libs (see README).
+Prerequisites: Rust 1.80+, Node 20+, Tauri CLI v2, Python 3 + Pillow, platform-specific C/WebKit libs (see README).
 
 ---
 
