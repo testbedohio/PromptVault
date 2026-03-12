@@ -14,6 +14,7 @@ fn db_path() -> PathBuf {
 
 pub struct Database {
     conn: Connection,
+    path: PathBuf,
 }
 
 // ─── Data Models ─────────────────────────────────────────────────
@@ -63,9 +64,14 @@ impl Database {
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
 
-        let db = Database { conn };
+        let db = Database { conn, path };
         db.initialize_schema()?;
         Ok(db)
+    }
+
+    /// Return the path to the database file (used for sync)
+    pub fn get_db_path(&self) -> String {
+        self.path.to_string_lossy().to_string()
     }
 
     /// Create all tables and FTS5 virtual table
