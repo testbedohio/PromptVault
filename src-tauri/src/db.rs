@@ -53,6 +53,32 @@ pub struct PromptVersion {
     pub created_at: String,
 }
 
+/// A persisted embedding record loaded from the `embeddings` table.
+/// `vector` is the f32 embedding restored from the raw BLOB.
+#[derive(Debug, Serialize, Clone)]
+pub struct StoredEmbedding {
+    pub prompt_id: i64,
+    pub vector: Vec<f32>,
+    pub model: String,
+    pub provider: String,
+}
+
+// ─── BLOB ↔ Vec<f32> helpers ────────────────────────────────────
+
+/// Serialize a slice of f32 values to a raw little-endian byte vector.
+/// This format is wire-compatible with sqlite-vec's native vec type,
+/// so upgrading to vec0 virtual tables later requires no migration.
+fn floats_to_blob(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
+
+/// Deserialize a raw little-endian BLOB back to Vec<f32>.
+fn blob_to_floats(b: &[u8]) -> Vec<f32> {
+    b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
 // ─── Database Implementation ─────────────────────────────────────
 
 impl Database {
@@ -126,10 +152,25 @@ impl Database {
                 tokenize='porter unicode61'
             );
 
+            -- Persistent embedding store (one row per prompt, upserted on re-embed).
+            -- Stores the latest embedding for the active provider/model.
+            -- The BLOB format (raw little-endian f32 bytes) is wire-compatible
+            -- with sqlite-vec's vec type, enabling future SQL similarity queries
+            -- without a data migration.
+            CREATE TABLE IF NOT EXISTS embeddings (
+                prompt_id  INTEGER PRIMARY KEY REFERENCES prompts(id) ON DELETE CASCADE,
+                vector     BLOB    NOT NULL,
+                model      TEXT    NOT NULL,
+                provider   TEXT    NOT NULL,
+                dimensions INTEGER NOT NULL,
+                updated_at TEXT    NOT NULL DEFAULT (datetime('now'))
+            );
+
             -- Indexes
             CREATE INDEX IF NOT EXISTS idx_prompts_category ON prompts(category_id);
             CREATE INDEX IF NOT EXISTS idx_prompt_versions_prompt ON prompt_versions(prompt_id);
             CREATE INDEX IF NOT EXISTS idx_categories_parent ON categories(parent_id);
+            CREATE INDEX IF NOT EXISTS idx_embeddings_model ON embeddings(model);
             "
         )?;
         Ok(())
@@ -459,5 +500,69 @@ impl Database {
             });
         }
         Ok(result)
+    }
+
+    // ── Embeddings ───────────────────────────────────────────────
+
+    /// Persist an embedding for a prompt. Uses INSERT OR REPLACE so calling
+    /// this after every (re)embed keeps the table current without manual deletes.
+    /// Vectors are stored as raw little-endian f32 bytes — the same binary
+    /// format used by sqlite-vec, so adding vec0 virtual tables later is a
+    /// schema-only change with no data migration required.
+    pub fn save_embedding(
+        &self,
+        prompt_id: i64,
+        vector: &[f32],
+        model: &str,
+        provider: &str,
+    ) -> Result<()> {
+        let blob = floats_to_blob(vector);
+        let dimensions = vector.len() as i64;
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT OR REPLACE INTO embeddings
+             (prompt_id, vector, model, provider, dimensions, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![prompt_id, blob, model, provider, dimensions, now],
+        )?;
+        Ok(())
+    }
+
+    /// Load all stored embeddings, optionally filtered to a specific model.
+    /// Pass `None` to retrieve every row (e.g. for bulk export or migration).
+    /// Pass `Some("all-MiniLM-L6-v2")` to restore only the local provider index.
+    pub fn get_all_embeddings(&self, model_filter: Option<&str>) -> Result<Vec<StoredEmbedding>> {
+        let rows = if let Some(model) = model_filter {
+            let mut stmt = self.conn.prepare(
+                "SELECT prompt_id, vector, model, provider
+                 FROM embeddings
+                 WHERE model = ?1"
+            )?;
+            stmt.query_map(params![model], |row| {
+                let blob: Vec<u8> = row.get(1)?;
+                Ok(StoredEmbedding {
+                    prompt_id: row.get(0)?,
+                    vector: blob_to_floats(&blob),
+                    model: row.get(2)?,
+                    provider: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>>>()?
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT prompt_id, vector, model, provider FROM embeddings"
+            )?;
+            stmt.query_map([], |row| {
+                let blob: Vec<u8> = row.get(1)?;
+                Ok(StoredEmbedding {
+                    prompt_id: row.get(0)?,
+                    vector: blob_to_floats(&blob),
+                    model: row.get(2)?,
+                    provider: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>>>()?
+        };
+        Ok(rows)
     }
 }
