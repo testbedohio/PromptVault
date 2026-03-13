@@ -1,6 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import {
   startOAuthFlow,
+  startTeamOAuthFlow,
+  connectTeamVault,
   getSyncConfig,
   syncToDrive,
   updateSyncConfig,
@@ -12,7 +14,6 @@ import {
 } from "../api/commands";
 
 // Open a URL in the system browser.
-// Uses the Tauri shell plugin when available, falls back to window.open.
 async function openUrl(url: string) {
   try {
     const { open } = await import("@tauri-apps/plugin-shell");
@@ -27,14 +28,14 @@ interface SyncPanelProps {
 }
 
 type AuthPhase =
-  | "idle"       // haven't started
-  | "waiting"    // browser open, polling for callback
-  | "connected"  // successfully authenticated
-  | "syncing"    // upload in progress
-  | "error";     // something went wrong
+  | "idle"
+  | "waiting"
+  | "connected"
+  | "syncing"
+  | "error";
 
 const POLL_INTERVAL_MS = 1500;
-const POLL_TIMEOUT_MS  = 200_000; // slightly longer than the Rust 3-min window
+const POLL_TIMEOUT_MS  = 200_000;
 
 const INTERVAL_OPTIONS: { label: string; value: number }[] = [
   { label: "Every 5 minutes",  value: 5  },
@@ -53,10 +54,16 @@ export default function SyncPanel({ onClose }: SyncPanelProps) {
   const [syncing, setSyncing]           = useState(false);
   const [savingAutoSync, setSavingAutoSync] = useState(false);
 
+  // Team vault state
+  const [teamVaultInput, setTeamVaultInput]   = useState("");
+  const [connectingTeam, setConnectingTeam]   = useState(false);
+  const [teamSection, setTeamSection]         = useState(false);
+  const [teamAuthWaiting, setTeamAuthWaiting] = useState(false);
+
   const pollRef    = useRef<ReturnType<typeof setInterval> | null>(null);
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // ── Load current config on mount ────────────────────────────────
+  // ── Load config on mount ─────────────────────────────────────────
 
   useEffect(() => {
     getSyncConfig()
@@ -65,13 +72,13 @@ export default function SyncPanel({ onClose }: SyncPanelProps) {
         if (isSyncConnected(cfg)) setPhase("connected");
         if (cfg.client_id) setClientId(cfg.client_id);
         if (cfg.client_secret) setClientSecret(cfg.client_secret);
+        if (cfg.team_mode) setTeamSection(true);
+        if (cfg.team_file_id) setTeamVaultInput(cfg.team_file_id);
       })
-      .catch(() => {
-        // Browser mode — Tauri not available
-      });
+      .catch(() => {});
   }, []);
 
-  // ── Polling ─────────────────────────────────────────────────────
+  // ── Polling ──────────────────────────────────────────────────────
 
   const stopPolling = useCallback(() => {
     if (pollRef.current)    clearInterval(pollRef.current);
@@ -90,29 +97,32 @@ export default function SyncPanel({ onClose }: SyncPanelProps) {
 
         if (isSyncConnected(cfg)) {
           setPhase("connected");
+          setTeamAuthWaiting(false);
           stopPolling();
         } else if (isSyncError(cfg)) {
           setPhase("error");
           setErrorMsg(getSyncStatusLabel(cfg));
+          setTeamAuthWaiting(false);
           stopPolling();
         }
       } catch {
-        // Transient error; keep polling
+        // Keep polling
       }
     }, POLL_INTERVAL_MS);
 
     timeoutRef.current = setTimeout(() => {
       stopPolling();
-      if (phase === "waiting") {
+      if (phase === "waiting" || teamAuthWaiting) {
         setPhase("error");
+        setTeamAuthWaiting(false);
         setErrorMsg("Sign-in timed out. Please try again.");
       }
     }, POLL_TIMEOUT_MS);
-  }, [stopPolling, phase]);
+  }, [stopPolling, phase, teamAuthWaiting]);
 
   useEffect(() => () => stopPolling(), [stopPolling]);
 
-  // ── Actions ──────────────────────────────────────────────────────
+  // ── Personal Auth ────────────────────────────────────────────────
 
   const handleSignIn = async () => {
     const id = clientId.trim();
@@ -131,6 +141,52 @@ export default function SyncPanel({ onClose }: SyncPanelProps) {
       setErrorMsg(e instanceof Error ? e.message : String(e));
     }
   };
+
+  // ── Team Auth ─────────────────────────────────────────────────────
+
+  const handleTeamSignIn = async () => {
+    const id = clientId.trim();
+    const secret = clientSecret.trim();
+    if (!id || !secret) return;
+
+    setTeamAuthWaiting(true);
+    setErrorMsg(null);
+
+    try {
+      const authUrl = await startTeamOAuthFlow(id, secret);
+      await openUrl(authUrl);
+      startPolling();
+    } catch (e) {
+      setTeamAuthWaiting(false);
+      setErrorMsg(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const handleConnectTeamVault = async () => {
+    const fileId = teamVaultInput.trim();
+    if (!fileId) return;
+
+    setConnectingTeam(true);
+    setErrorMsg(null);
+
+    try {
+      await connectTeamVault(fileId);
+      const cfg = await getSyncConfig();
+      setConfig(cfg);
+    } catch (e) {
+      setErrorMsg(e instanceof Error ? e.message : String(e));
+    } finally {
+      setConnectingTeam(false);
+    }
+  };
+
+  const copyTeamFileId = () => {
+    if (config?.team_file_id) {
+      navigator.clipboard.writeText(config.team_file_id).catch(() => {});
+    }
+  };
+
+  // ── Manual Sync ──────────────────────────────────────────────────
 
   const handleSyncNow = async () => {
     setSyncing(true);
@@ -156,13 +212,15 @@ export default function SyncPanel({ onClose }: SyncPanelProps) {
       remote_file_id: null,
       sync_status: "Disconnected",
       auto_sync_enabled: false,
+      team_mode: false,
+      team_file_id: null,
     };
     try {
       await updateSyncConfig(reset);
-      // Also stop the background worker
       await setAutoSync(false, config.auto_sync_interval_mins ?? 5);
       setConfig(reset);
       setPhase("idle");
+      setTeamSection(false);
       setErrorMsg(null);
     } catch (e) {
       setErrorMsg(e instanceof Error ? e.message : String(e));
@@ -201,53 +259,48 @@ export default function SyncPanel({ onClose }: SyncPanelProps) {
 
   const canSignIn = clientId.trim().length > 0 && clientSecret.trim().length > 0;
 
-  // ── Render ───────────────────────────────────────────────────────
+  // ── Render ────────────────────────────────────────────────────────
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-start justify-center pt-[12vh]"
+      className="fixed inset-0 z-50 flex items-start justify-center pt-[8vh]"
       onClick={onClose}
     >
       <div className="absolute inset-0 bg-black/50" />
 
       <div
-        className="relative w-full max-w-md bg-darcula-bg-light border border-darcula-border rounded-lg shadow-2xl overflow-hidden"
+        className="relative w-full max-w-md bg-darcula-bg-light border border-darcula-border rounded-lg shadow-2xl overflow-hidden max-h-[84vh] flex flex-col"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
-        <div className="px-4 py-3 border-b border-darcula-border flex items-center justify-between">
+        <div className="px-4 py-3 border-b border-darcula-border flex items-center justify-between flex-shrink-0">
           <div>
             <h2 className="text-sm font-mono font-semibold text-darcula-text-bright">
               ☁️ Google Drive Sync
             </h2>
             <p className="text-2xs font-mono text-darcula-text-muted mt-0.5">
-              Back up your prompt database to Google Drive
+              Back up and share your prompt database
             </p>
           </div>
-          <button
-            className="text-darcula-text-muted hover:text-darcula-text text-sm"
-            onClick={onClose}
-          >
+          <button className="text-darcula-text-muted hover:text-darcula-text text-sm" onClick={onClose}>
             ×
           </button>
         </div>
 
         {/* Status bar */}
-        <div className="px-4 py-2.5 border-b border-darcula-border flex items-center gap-2">
-          <span
-            className={`w-2 h-2 rounded-full flex-shrink-0 ${
-              isConnected
-                ? "bg-darcula-success"
-                : phase === "waiting"
-                ? "bg-darcula-warning animate-pulse"
-                : "bg-darcula-text-muted"
-            }`}
-          />
+        <div className="px-4 py-2.5 border-b border-darcula-border flex items-center gap-2 flex-shrink-0">
+          <span className={`w-2 h-2 rounded-full flex-shrink-0 ${
+            isConnected
+              ? "bg-darcula-success"
+              : phase === "waiting" || teamAuthWaiting
+              ? "bg-darcula-warning animate-pulse"
+              : "bg-darcula-text-muted"
+          }`} />
           <span className="text-xs font-mono text-darcula-text">
-            {phase === "waiting"
+            {phase === "waiting" || teamAuthWaiting
               ? "Waiting for Google sign-in…"
               : isConnected
-              ? "Connected"
+              ? `Connected${config?.team_mode ? " (Team Mode)" : ""}`
               : "Disconnected"}
           </span>
           {config?.last_sync && isConnected && (
@@ -259,23 +312,22 @@ export default function SyncPanel({ onClose }: SyncPanelProps) {
 
         {/* Error banner */}
         {errorMsg && (
-          <div className="px-4 py-2 bg-darcula-error/10 border-b border-darcula-error/30">
+          <div className="px-4 py-2 bg-darcula-error/10 border-b border-darcula-error/30 flex-shrink-0">
             <p className="text-2xs font-mono text-darcula-error">{errorMsg}</p>
           </div>
         )}
 
-        {/* Body */}
-        <div className="px-4 py-3">
+        {/* Scrollable body */}
+        <div className="px-4 py-3 overflow-y-auto flex-1">
           {isConnected ? (
-            /* ── Connected state ── */
+            /* ── Connected ─────────────────────────────────────── */
             <div className="space-y-3">
               <p className="text-2xs font-mono text-darcula-text-muted">
-                Your prompt database is synced to Google Drive's hidden app data
-                folder. Only PromptVault can access this data — it won't appear
-                in your regular Drive files.
+                {config?.team_mode
+                  ? "Team mode is active. Your vault syncs to a shared Drive file that teammates can access."
+                  : "Your prompt database is synced to Google Drive's hidden app data folder."}
               </p>
 
-              {/* Manual sync button */}
               <button
                 className="w-full text-xs font-mono px-3 py-2 rounded-sm bg-darcula-accent text-white hover:bg-darcula-accent-bright transition-colors disabled:opacity-50"
                 onClick={handleSyncNow}
@@ -284,33 +336,23 @@ export default function SyncPanel({ onClose }: SyncPanelProps) {
                 {syncing ? "Syncing…" : "Sync Now"}
               </button>
 
-              {/* ── Auto-sync settings ── */}
+              {/* Auto-sync */}
               <div className="border border-darcula-border rounded-sm p-3 space-y-2.5">
                 <div className="flex items-center justify-between">
-                  <span className="text-xs font-mono text-darcula-text">
-                    Auto-sync
-                  </span>
-
-                  {/* Toggle */}
+                  <span className="text-xs font-mono text-darcula-text">Auto-sync</span>
                   <button
-                    className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors focus:outline-none disabled:opacity-40 ${
-                      config?.auto_sync_enabled
-                        ? "bg-darcula-accent"
-                        : "bg-darcula-border"
+                    className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors disabled:opacity-40 ${
+                      config?.auto_sync_enabled ? "bg-darcula-accent" : "bg-darcula-border"
                     }`}
                     onClick={handleAutoSyncToggle}
                     disabled={savingAutoSync}
-                    title={config?.auto_sync_enabled ? "Disable auto-sync" : "Enable auto-sync"}
                   >
-                    <span
-                      className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
-                        config?.auto_sync_enabled ? "translate-x-4" : "translate-x-0.5"
-                      }`}
-                    />
+                    <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
+                      config?.auto_sync_enabled ? "translate-x-4" : "translate-x-0.5"
+                    }`} />
                   </button>
                 </div>
 
-                {/* Interval selector — only shown when auto-sync is on */}
                 {config?.auto_sync_enabled && (
                   <div>
                     <label className="text-2xs font-mono text-darcula-text-muted uppercase tracking-wider block mb-1">
@@ -323,7 +365,7 @@ export default function SyncPanel({ onClose }: SyncPanelProps) {
                           className={`text-2xs font-mono px-2.5 py-1 rounded-sm border transition-colors disabled:opacity-40 ${
                             config.auto_sync_interval_mins === opt.value
                               ? "border-darcula-accent bg-darcula-accent/20 text-darcula-accent-bright"
-                              : "border-darcula-border text-darcula-text-muted hover:border-darcula-accent/60 hover:text-darcula-text"
+                              : "border-darcula-border text-darcula-text-muted hover:border-darcula-accent/60"
                           }`}
                           onClick={() => handleIntervalChange(opt.value)}
                           disabled={savingAutoSync}
@@ -334,14 +376,39 @@ export default function SyncPanel({ onClose }: SyncPanelProps) {
                     </div>
                   </div>
                 )}
-
-                {config?.auto_sync_enabled && (
-                  <p className="text-2xs font-mono text-darcula-text-muted">
-                    PromptVault will silently upload your database in the background.
-                    Syncs only occur when Google Drive is connected.
-                  </p>
-                )}
               </div>
+
+              {/* Team Vault section (connected state) */}
+              {config?.team_mode && config.team_file_id && (
+                <div className="border border-darcula-accent/30 rounded-sm p-3 bg-darcula-accent/5 space-y-2">
+                  <div className="flex items-center gap-2">
+                    <span className="text-2xs font-mono font-semibold text-darcula-accent-bright uppercase tracking-wider">
+                      Team Vault
+                    </span>
+                    <span className="text-2xs font-mono px-1.5 py-0.5 bg-darcula-accent/20 text-darcula-accent-bright rounded-sm">
+                      Active
+                    </span>
+                  </div>
+                  <p className="text-2xs font-mono text-darcula-text-muted">
+                    Share this File ID with teammates. They paste it into their own
+                    PromptVault to connect to this shared vault.
+                  </p>
+                  <div className="flex items-center gap-2">
+                    <code className="flex-1 text-2xs font-mono bg-darcula-bg px-2 py-1 rounded-sm text-darcula-string truncate">
+                      {config.team_file_id}
+                    </code>
+                    <button
+                      className="text-2xs font-mono px-2 py-1 rounded-sm bg-darcula-bg border border-darcula-border text-darcula-text-muted hover:text-darcula-text transition-colors flex-shrink-0"
+                      onClick={copyTeamFileId}
+                    >
+                      Copy
+                    </button>
+                  </div>
+                  <p className="text-2xs font-mono text-darcula-text-muted">
+                    You can also share the file via Google Drive's sharing settings for finer access control.
+                  </p>
+                </div>
+              )}
 
               <button
                 className="block text-2xs font-mono text-darcula-error hover:underline"
@@ -350,8 +417,8 @@ export default function SyncPanel({ onClose }: SyncPanelProps) {
                 Disconnect Google Drive
               </button>
             </div>
-          ) : phase === "waiting" ? (
-            /* ── Waiting for callback ── */
+          ) : phase === "waiting" || teamAuthWaiting ? (
+            /* ── Waiting for OAuth callback ─────────────────────── */
             <div className="space-y-3 py-2">
               <div className="flex items-center gap-3">
                 <div className="w-4 h-4 border-2 border-darcula-accent border-t-transparent rounded-full animate-spin flex-shrink-0" />
@@ -362,79 +429,152 @@ export default function SyncPanel({ onClose }: SyncPanelProps) {
               <p className="text-2xs font-mono text-darcula-text-muted">
                 A browser tab should have opened to Google's sign-in page.
                 After you approve access, this panel will update automatically.
-                The window closes in 3 minutes.
               </p>
               <button
                 className="text-2xs font-mono text-darcula-text-muted hover:text-darcula-text transition-colors"
-                onClick={() => {
-                  stopPolling();
-                  setPhase("idle");
-                  setErrorMsg(null);
-                }}
+                onClick={() => { stopPolling(); setPhase("idle"); setTeamAuthWaiting(false); setErrorMsg(null); }}
               >
                 Cancel
               </button>
             </div>
           ) : (
-            /* ── Setup / disconnected state ── */
-            <div className="space-y-3">
-              <p className="text-2xs font-mono text-darcula-text-muted">
-                You need a Google Cloud OAuth 2.0 Client ID. Create one at{" "}
-                <span className="text-darcula-accent-bright">
-                  console.cloud.google.com
-                </span>{" "}
-                with the Drive API scope and{" "}
-                <span className="text-darcula-accent-bright">
-                  http://localhost:8741/callback
-                </span>{" "}
-                as an authorized redirect URI.
-              </p>
+            /* ── Setup / Disconnected ────────────────────────────── */
+            <div className="space-y-4">
+              {/* Credentials */}
+              <div className="space-y-3">
+                <p className="text-2xs font-mono text-darcula-text-muted">
+                  Create an OAuth 2.0 Client ID at{" "}
+                  <span className="text-darcula-accent-bright">console.cloud.google.com</span>
+                  {" "}with{" "}
+                  <span className="text-darcula-accent-bright">http://localhost:8741/callback</span>
+                  {" "}as a redirect URI.
+                </p>
 
-              {/* Client ID */}
-              <div>
-                <label className="text-2xs font-mono text-darcula-text-muted uppercase tracking-wider block mb-1">
-                  Client ID
-                </label>
-                <input
-                  type={showSecrets ? "text" : "password"}
-                  placeholder="xxxxxxxxx.apps.googleusercontent.com"
-                  className="w-full bg-darcula-bg text-darcula-text text-xs font-mono px-3 py-2 rounded-sm border border-darcula-border outline-none focus:border-darcula-accent"
-                  value={clientId}
-                  onChange={(e) => setClientId(e.target.value)}
-                  onKeyDown={(e) => e.key === "Enter" && canSignIn && handleSignIn()}
-                />
-              </div>
-
-              {/* Client Secret */}
-              <div>
-                <label className="text-2xs font-mono text-darcula-text-muted uppercase tracking-wider block mb-1">
-                  Client Secret
-                </label>
-                <div className="flex gap-2">
+                <div>
+                  <label className="text-2xs font-mono text-darcula-text-muted uppercase tracking-wider block mb-1">
+                    Client ID
+                  </label>
                   <input
                     type={showSecrets ? "text" : "password"}
-                    placeholder="GOCSPX-…"
-                    className="flex-1 bg-darcula-bg text-darcula-text text-xs font-mono px-3 py-2 rounded-sm border border-darcula-border outline-none focus:border-darcula-accent"
-                    value={clientSecret}
-                    onChange={(e) => setClientSecret(e.target.value)}
-                    onKeyDown={(e) => e.key === "Enter" && canSignIn && handleSignIn()}
+                    placeholder="xxxxxxxxx.apps.googleusercontent.com"
+                    className="w-full bg-darcula-bg text-darcula-text text-xs font-mono px-3 py-2 rounded-sm border border-darcula-border outline-none focus:border-darcula-accent"
+                    value={clientId}
+                    onChange={(e) => setClientId(e.target.value)}
                   />
-                  <button
-                    className="text-2xs font-mono text-darcula-text-muted hover:text-darcula-text px-2"
-                    onClick={() => setShowSecrets(!showSecrets)}
-                  >
-                    {showSecrets ? "hide" : "show"}
-                  </button>
+                </div>
+
+                <div>
+                  <label className="text-2xs font-mono text-darcula-text-muted uppercase tracking-wider block mb-1">
+                    Client Secret
+                  </label>
+                  <div className="flex gap-2">
+                    <input
+                      type={showSecrets ? "text" : "password"}
+                      placeholder="GOCSPX-…"
+                      className="flex-1 bg-darcula-bg text-darcula-text text-xs font-mono px-3 py-2 rounded-sm border border-darcula-border outline-none focus:border-darcula-accent"
+                      value={clientSecret}
+                      onChange={(e) => setClientSecret(e.target.value)}
+                    />
+                    <button
+                      className="text-2xs font-mono text-darcula-text-muted hover:text-darcula-text px-2"
+                      onClick={() => setShowSecrets(!showSecrets)}
+                    >
+                      {showSecrets ? "hide" : "show"}
+                    </button>
+                  </div>
                 </div>
               </div>
 
-              <button
-                className="w-full text-xs font-mono px-3 py-2 rounded-sm bg-darcula-accent text-white hover:bg-darcula-accent-bright transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-                onClick={handleSignIn}
-                disabled={!canSignIn}
-              >
-                Sign in with Google
-              </button>
+              {/* Personal sync button */}
+              <div className="space-y-2">
+                <button
+                  className="w-full text-xs font-mono px-3 py-2 rounded-sm bg-darcula-accent text-white hover:bg-darcula-accent-bright transition-colors disabled:opacity-40"
+                  onClick={handleSignIn}
+                  disabled={!canSignIn}
+                >
+                  Sign in with Google (Personal)
+                </button>
+                <p className="text-2xs font-mono text-darcula-text-muted text-center">
+                  Syncs to your private Drive app folder — not visible to others.
+                </p>
+              </div>
+
+              {/* Team mode toggle */}
+              <div className="border border-darcula-border rounded-sm overflow-hidden">
+                <button
+                  className="w-full flex items-center justify-between px-3 py-2.5 bg-darcula-bg-lighter hover:bg-darcula-bg transition-colors"
+                  onClick={() => setTeamSection(!teamSection)}
+                >
+                  <span className="text-xs font-mono text-darcula-text-bright flex items-center gap-2">
+                    👥 Team / Shared Vault
+                    <span className="text-2xs font-mono px-1.5 py-0.5 bg-darcula-accent/20 text-darcula-accent-bright rounded-sm">
+                      New
+                    </span>
+                  </span>
+                  <span className="text-darcula-text-muted text-xs">{teamSection ? "▲" : "▼"}</span>
+                </button>
+
+                {teamSection && (
+                  <div className="px-3 py-3 space-y-3 border-t border-darcula-border">
+                    <p className="text-2xs font-mono text-darcula-text-muted">
+                      Team mode creates a Drive file that can be shared with others.
+                      It requires re-authorising with expanded permissions (drive.file scope).
+                    </p>
+
+                    {/* Create new team vault */}
+                    <div className="space-y-1.5">
+                      <label className="text-2xs font-mono text-darcula-text-muted uppercase tracking-wider block">
+                        Create New Shared Vault
+                      </label>
+                      <button
+                        className="w-full text-xs font-mono px-3 py-2 rounded-sm border border-darcula-accent text-darcula-accent-bright hover:bg-darcula-accent/10 transition-colors disabled:opacity-40"
+                        onClick={handleTeamSignIn}
+                        disabled={!canSignIn}
+                      >
+                        Sign in with Google (Team Mode)
+                      </button>
+                      <p className="text-2xs font-mono text-darcula-text-muted">
+                        Creates a shared file in your Drive root. A File ID will be generated that you can share with teammates.
+                      </p>
+                    </div>
+
+                    <div className="flex items-center gap-2 text-2xs font-mono text-darcula-text-muted">
+                      <div className="flex-1 h-px bg-darcula-border" />
+                      <span>or</span>
+                      <div className="flex-1 h-px bg-darcula-border" />
+                    </div>
+
+                    {/* Join existing team vault */}
+                    <div className="space-y-1.5">
+                      <label className="text-2xs font-mono text-darcula-text-muted uppercase tracking-wider block">
+                        Join Existing Vault
+                      </label>
+                      <div className="flex gap-2">
+                        <input
+                          type="text"
+                          placeholder="Paste File ID from teammate…"
+                          className="flex-1 bg-darcula-bg text-darcula-text text-xs font-mono px-3 py-2 rounded-sm border border-darcula-border outline-none focus:border-darcula-accent"
+                          value={teamVaultInput}
+                          onChange={(e) => setTeamVaultInput(e.target.value)}
+                        />
+                        <button
+                          className="text-xs font-mono px-3 py-2 rounded-sm bg-darcula-accent text-white hover:bg-darcula-accent-bright transition-colors disabled:opacity-40"
+                          onClick={handleConnectTeamVault}
+                          disabled={!teamVaultInput.trim() || connectingTeam || !isConnected}
+                          title={!isConnected ? "Sign in first" : ""}
+                        >
+                          {connectingTeam ? "…" : "Join"}
+                        </button>
+                      </div>
+                      {!isConnected && (
+                        <p className="text-2xs font-mono text-darcula-warning">
+                          Sign in with Google first, then enter the team vault ID.
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
             </div>
           )}
         </div>
