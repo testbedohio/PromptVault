@@ -782,6 +782,169 @@ fn reset_shortcuts() -> ApiResult<std::collections::HashMap<String, String>> {
 
 // ─── App Entry ───────────────────────────────────────────────────
 
+
+// ─── Multi-device / Team Sync Commands ───────────────────────────────────────
+
+/// Result returned by `init_sync_session`.
+///
+/// Called once immediately after OAuth completes (or on startup when already
+/// connected). Searches appDataFolder for an existing `prompt_vault.db` and
+/// claims it if found — preventing a second device from creating a duplicate.
+///
+/// `found_remote` is `true` when a file was found that predates the local
+/// `last_sync` (i.e. another device has already uploaded data). The frontend
+/// should offer to pull the remote DB down when this is true.
+#[derive(Serialize)]
+struct SyncSessionInfo {
+    /// True when an existing remote file was found (and its ID was claimed).
+    found_remote: bool,
+    /// The remote file's RFC 3339 modifiedTime, when found.
+    remote_modified: Option<String>,
+    /// True when the remote is newer than our last_sync (conflict-style check).
+    remote_is_newer: bool,
+}
+
+#[tauri::command]
+async fn init_sync_session(
+    state: State<'_, AppState>,
+) -> Result<ApiResult<SyncSessionInfo>, ()> {
+    let mut sync = state.sync.lock().await;
+    let config = sync.get_config().clone();
+
+    // Already has a remote file ID — nothing to discover.
+    // Just report whether the remote is newer (reuses existing conflict logic).
+    if config.remote_file_id.is_some() || config.team_mode {
+        let remote_modified = match sync.check_remote_status().await {
+            Ok(Some(t)) => Some(t),
+            _ => None,
+        };
+        let remote_is_newer = match (&remote_modified, &config.last_sync) {
+            (Some(r), Some(l)) => {
+                use chrono::DateTime;
+                let rt = DateTime::parse_from_rfc3339(r).ok();
+                let lt = DateTime::parse_from_rfc3339(l).ok();
+                matches!((rt, lt), (Some(rv), Some(lv)) if rv > lv)
+            }
+            (Some(_), None) => true,
+            _ => false,
+        };
+        return Ok(ok(SyncSessionInfo {
+            found_remote: config.remote_file_id.is_some(),
+            remote_modified,
+            remote_is_newer,
+        }));
+    }
+
+    // No remote_file_id — search appDataFolder for an existing file.
+    match sync.find_existing_db().await {
+        Ok(Some((file_id, modified_time))) => {
+            // Claim the existing file so future uploads update it, not a new one.
+            if let Err(e) = sync.claim_remote_file(&file_id, &modified_time) {
+                return Ok(err(&e));
+            }
+
+            // The remote is always "newer" on first discovery from a new device —
+            // the user should decide whether to pull it down.
+            Ok(ok(SyncSessionInfo {
+                found_remote: true,
+                remote_modified: Some(modified_time),
+                remote_is_newer: true,
+            }))
+        }
+        Ok(None) => {
+            // First device ever — no remote file exists yet.
+            Ok(ok(SyncSessionInfo {
+                found_remote: false,
+                remote_modified: None,
+                remote_is_newer: false,
+            }))
+        }
+        Err(e) => Ok(err(&e)),
+    }
+}
+
+/// Start the Google Drive OAuth flow with the `drive.file` scope (team mode).
+///
+/// The `drive.file` scope allows creating and updating files the app created,
+/// but stored in the user's Drive root rather than the hidden appDataFolder.
+/// This makes it possible to share the file with teammates via Google Drive's
+/// sharing UI.
+///
+/// After OAuth completes, call `init_sync_session` to discover the file, then
+/// use the returned file ID as the team vault ID.
+#[tauri::command]
+async fn start_team_oauth_flow(
+    client_id: String,
+    client_secret: String,
+    state: State<'_, AppState>,
+) -> Result<ApiResult<String>, ()> {
+    let auth_url = {
+        let mut sync = state.sync.lock().await;
+        let mut config = sync.get_config().clone();
+        config.client_id = client_id;
+        config.client_secret = client_secret;
+        config.team_mode = true;
+        if let Err(e) = sync.update_config(config) {
+            return Ok(err(&e));
+        }
+        match sync.get_team_auth_url() {
+            Ok(url) => url,
+            Err(e) => return Ok(err(&e)),
+        }
+    };
+
+    let sync_arc = Arc::clone(&state.sync);
+    let db_path = state.db_path.clone();
+
+    tokio::spawn(async move {
+        match sync::await_oauth_callback().await {
+            Ok(code) => {
+                let mut sync = sync_arc.lock().await;
+                if let Err(e) = sync.exchange_code(&code).await {
+                    let mut config = sync.get_config().clone();
+                    config.sync_status = SyncStatus::Error(e.clone());
+                    sync.update_config(config).ok();
+                    eprintln!("[PromptVault] Team OAuth exchange failed: {}", e);
+                    return;
+                }
+                // Automatically create the team file so the user gets a file ID immediately.
+                if let Err(e) = sync.create_team_file(&db_path).await {
+                    eprintln!("[PromptVault] Team file creation failed: {}", e);
+                }
+            }
+            Err(e) => {
+                let mut sync = sync_arc.lock().await;
+                let mut config = sync.get_config().clone();
+                config.sync_status = SyncStatus::Error(e.clone());
+                sync.update_config(config).ok();
+                eprintln!("[PromptVault] Team OAuth callback error: {}", e);
+            }
+        }
+    });
+
+    Ok(ok(auth_url))
+}
+
+/// Connect to an existing team vault by its Drive file ID.
+///
+/// Teammates paste the file ID (shared by the vault creator) here.
+/// After calling this, `sync_to_drive` will update the shared file and
+/// `resolve_conflict` / `get_conflict_info` will compare against it.
+///
+/// Requires the user to already be authenticated (personal OAuth is sufficient
+/// if the file has been shared with them via Google Drive sharing).
+#[tauri::command]
+async fn connect_team_vault(
+    file_id: String,
+    state: State<'_, AppState>,
+) -> Result<ApiResult<bool>, ()> {
+    let mut sync = state.sync.lock().await;
+    match sync.connect_team_vault(&file_id) {
+        Ok(_) => Ok(ok(true)),
+        Err(e) => Ok(err(&e)),
+    }
+}
+
 pub fn run() {
     let db = Database::new().expect("Failed to initialize database");
     let db_path = db.get_db_path();
@@ -829,6 +992,9 @@ pub fn run() {
             export_prompt_markdown,
             export_prompts_json,
             start_oauth_flow,
+            init_sync_session,
+            start_team_oauth_flow,
+            connect_team_vault,
             get_sync_config,
             update_sync_config,
             get_auth_url,
