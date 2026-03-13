@@ -9,6 +9,8 @@ import CommandPalette from "./components/CommandPalette";
 import NewPromptDialog from "./components/NewPromptDialog";
 import BrainSelector from "./components/BrainSelector";
 import SyncPanel from "./components/SyncPanel";
+import ConflictDialog from "./components/ConflictDialog";
+import { getConflictInfo, getSyncConfig, isSyncConnected, type ConflictInfo } from "./api/commands";
 
 export default function App() {
   // Panel widths
@@ -21,6 +23,7 @@ export default function App() {
   const [newPromptDialogOpen, setNewPromptDialogOpen] = useState(false);
   const [brainSelectorOpen, setBrainSelectorOpen] = useState(false);
   const [syncPanelOpen, setSyncPanelOpen] = useState(false);
+  const [conflict, setConflict] = useState<ConflictInfo | null>(null);
 
   // Data from Tauri backend (or browser fallback)
   const {
@@ -63,13 +66,30 @@ export default function App() {
     }
   }, [loading, prompts.length, embeddings.restoreAttempted, embeddings.restoreIndex]);
 
-  const activeSnippet = prompts.find((s) => s.id === activeTab) || null;
+  // Check for a Drive conflict once on startup, after data has loaded.
+  // Only fires when the user is connected to Google Drive.
+  useEffect(() => {
+    if (loading) return;
+    getSyncConfig()
+      .then((cfg) => {
+        if (!isSyncConnected(cfg)) return;
+        return getConflictInfo();
+      })
+      .then((info) => {
+        if (info) setConflict(info);
+      })
+      .catch(() => {
+        // Network error or Tauri not available — ignore silently
+      });
+  }, [loading]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const filteredPrompts = prompts.filter((p) => {
     if (selectedCategory !== null && p.category_id !== selectedCategory) return false;
     if (activeTagFilter && !p.tags.includes(activeTagFilter)) return false;
     return true;
   });
+
+  const activeSnippet = prompts.find((s) => s.id === activeTab) || null;
 
   const openSnippet = useCallback(
     (id: number) => {
@@ -352,6 +372,20 @@ export default function App() {
 
       {syncPanelOpen && (
         <SyncPanel onClose={() => setSyncPanelOpen(false)} />
+      )}
+
+      {conflict && (
+        <ConflictDialog
+          conflict={conflict}
+          onResolved={(dataReplaced) => {
+            setConflict(null);
+            if (dataReplaced) {
+              // Remote DB was pulled in — reload everything from the (now-replaced) DB
+              window.location.reload();
+            }
+          }}
+          onDismiss={() => setConflict(null)}
+        />
       )}
     </div>
   );
