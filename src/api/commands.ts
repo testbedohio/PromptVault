@@ -94,15 +94,7 @@ export async function saveEmbedding(
  * Load all stored embeddings for a specific provider.
  *
  * Pass the provider name ("local", "gemini", or "voyage") to retrieve only
- * that provider's vectors — the right thing to do on startup or after a
- * provider switch.  Pass an empty string to retrieve every row.
- *
- * This replaces the old model-filtered API.  The provider name is the correct
- * key for Option B because:
- *   - Each provider always maps to exactly one model (local→all-MiniLM-L6-v2,
- *     gemini→text-embedding-004, voyage→voyage-3-lite).
- *   - Filtering by provider is forward-compatible if a provider ever updates
- *     its default model — the old vectors are simply overwritten on re-index.
+ * that provider's vectors.  Pass an empty string to retrieve every row.
  */
 export async function getAllEmbeddings(provider: string = ""): Promise<StoredEmbedding[]> {
   return call<StoredEmbedding[]>("get_all_embeddings", { provider });
@@ -110,10 +102,6 @@ export async function getAllEmbeddings(provider: string = ""): Promise<StoredEmb
 
 /**
  * Delete all stored embeddings for a specific provider.
- *
- * Used by BrainSelector's "Rebuild Index" button to clear stale vectors before
- * a full re-index.  Rows for other providers are not affected.
- *
  * Returns the number of rows deleted.
  */
 export async function deleteEmbeddingsByProvider(provider: string): Promise<number> {
@@ -132,6 +120,10 @@ export interface SyncConfig {
   remote_file_id: string | null;
   last_sync: string | null;
   sync_status: string | { Error: string };
+  /** Whether the periodic background sync worker should run. */
+  auto_sync_enabled: boolean;
+  /** How often the worker uploads, in minutes (5 / 15 / 30 / 60). */
+  auto_sync_interval_mins: number;
 }
 
 export function isSyncConnected(config: SyncConfig): boolean {
@@ -163,10 +155,7 @@ export async function startOAuthFlow(
   clientId: string,
   clientSecret: string
 ): Promise<string> {
-  return call<string>("start_oauth_flow", {
-    clientId,
-    clientSecret,
-  });
+  return call<string>("start_oauth_flow", { clientId, clientSecret });
 }
 
 export async function getSyncConfig(): Promise<SyncConfig> {
@@ -191,4 +180,20 @@ export async function syncToDrive(): Promise<boolean> {
 
 export async function checkSyncStatus(): Promise<string | null> {
   return call<string | null>("check_sync_status");
+}
+
+/**
+ * Enable or disable the periodic background sync worker.
+ *
+ * @param enabled       Whether to run the worker.
+ * @param intervalMins  Upload interval in minutes (5 / 15 / 30 / 60).
+ *
+ * The setting is persisted to disk immediately and the live worker is
+ * notified via an internal watch channel — no app restart needed.
+ */
+export async function setAutoSync(
+  enabled: boolean,
+  intervalMins: number
+): Promise<boolean> {
+  return call<boolean>("set_auto_sync", { enabled, intervalMins });
 }
