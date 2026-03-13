@@ -962,12 +962,18 @@ pub fn run() {
 
     let db_locked = Arc::new(AtomicBool::new(is_encrypted_on_disk()));
 
-    let worker_sync = Arc::clone(&sync_arc);
-    let worker_db_path = db_path.clone();
-    tokio::spawn(run_sync_worker(worker_sync, worker_db_path, worker_rx));
-
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .setup(move |_app| {
+            // Spawn the background sync worker here, inside Tauri's setup hook,
+            // so that Tokio's runtime is already running when we call spawn().
+            // Calling tokio::spawn() before tauri::Builder::run() panics because
+            // no reactor exists yet.
+            let worker_sync = Arc::clone(&sync_arc);
+            let worker_db_path = db_path.clone();
+            tokio::spawn(run_sync_worker(worker_sync, worker_db_path, worker_rx));
+            Ok(())
+        })
         .manage(AppState {
             db: StdMutex::new(db),
             sync: sync_arc,
