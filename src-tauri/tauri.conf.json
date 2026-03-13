@@ -22,7 +22,26 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": {
+        "default-src": ["'self'"],
+        "script-src": ["'self'", "blob:", "'wasm-unsafe-eval'"],
+        "style-src": ["'self'", "'unsafe-inline'"],
+        "img-src": ["'self'", "data:", "blob:"],
+        "font-src": ["'self'", "data:"],
+        "worker-src": ["'self'", "blob:"],
+        "connect-src": [
+          "'self'",
+          "https://accounts.google.com",
+          "https://oauth2.googleapis.com",
+          "https://www.googleapis.com",
+          "https://generativelanguage.googleapis.com",
+          "https://api.voyageai.com",
+          "https://huggingface.co",
+          "https://cdn-lfs.huggingface.co",
+          "https://cdn-lfs-us-1.huggingface.co"
+        ],
+        "media-src": ["'self'", "blob:"]
+      }
     }
   },
   "bundle": {
