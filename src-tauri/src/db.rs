@@ -656,6 +656,38 @@ impl Database {
         Ok(count)
     }
 
+    // ── SQLCipher key management ──────────────────────────────────
+
+    /// Apply the SQLCipher decryption key to this connection.
+    ///
+    /// **Must be called before any other statement on an encrypted database.**
+    /// For a plaintext database this is a no-op (SQLCipher accepts an empty key
+    /// for unencrypted files), so it is safe to call unconditionally when a key
+    /// is present.
+    ///
+    /// Returns `Err` if the key is wrong (subsequent sqlite_master read fails).
+    pub fn apply_key(&self, key_hex: &str) -> Result<()> {
+        self.conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";\n", key_hex))?;
+        // Verify by touching the schema — SQLCipher returns SQLITE_NOTADB on bad key.
+        self.conn.execute_batch("SELECT count(*) FROM sqlite_master;")?;
+        Ok(())
+    }
+
+    /// Re-key the database (encrypt plaintext DB, change key, or remove encryption).
+    ///
+    /// - `Some(hex)` → encrypt (or re-encrypt) with the given key.
+    /// - `None`      → remove encryption (decrypt to plaintext).
+    ///
+    /// The current key must already be applied via `apply_key` before calling this.
+    pub fn rekey(&self, new_key_hex: Option<&str>) -> Result<()> {
+        let pragma = match new_key_hex {
+            Some(hex) => format!("PRAGMA rekey = \"x'{}'\";", hex),
+            None      => "PRAGMA rekey = \"\";".to_string(),
+        };
+        self.conn.execute_batch(&pragma)?;
+        Ok(())
+    }
+
     // ── Conflict resolution ───────────────────────────────────────
 
     /// Replace the contents of the live database connection with those from a
