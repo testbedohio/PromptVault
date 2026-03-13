@@ -63,19 +63,12 @@ pub struct StoredEmbedding {
     pub provider: String,
 }
 
-/// Result from a SQL-native cosine similarity search.
-/// `score` is in [0.0, 1.0] — higher means more similar.
+/// A result from the SQL-level vector similarity search.
+/// `similarity` is in [0.0, 1.0] where 1.0 = identical direction.
 #[derive(Debug, Serialize, Clone)]
-pub struct SimilarityResult {
+pub struct VectorSearchResult {
     pub prompt_id: i64,
-    pub title: String,
-    pub content: String,
-    pub category_id: Option<i64>,
-    pub tags: Vec<String>,
-    pub created_at: String,
-    pub updated_at: String,
-    /// Cosine similarity in [0.0, 1.0]. 1.0 = identical direction.
-    pub score: f64,
+    pub similarity: f32,
 }
 
 // ─── BLOB ↔ Vec<f32> helpers ────────────────────────────────────
@@ -94,60 +87,34 @@ fn blob_to_floats(b: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-// ─── SQL Scalar Functions ─────────────────────────────────────────
-//
-// Phase 6: Register a vec_cosine_distance(blob_a, blob_b) scalar
-// function directly in rusqlite.  This gives the same SQL-native
-// similarity queries that sqlite-vec's vec_distance_cosine() provides,
-// using the same raw f32 BLOB format already stored in the embeddings
-// table.  Migrating to sqlite-vec virtual tables in a future phase
-// requires only a schema change — no data migration.
-//
-// The function returns a cosine *distance* (1 − similarity) so that
-// ORDER BY distance ASC == most-similar first, matching sqlite-vec's
-// convention.
+// ─── sqlite-vec Extension ────────────────────────────────────────
 
-fn register_vec_functions(conn: &Connection) -> Result<()> {
-    use rusqlite::functions::FunctionFlags;
-
-    conn.create_scalar_function(
-        "vec_cosine_distance",
-        2,
-        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
-        |ctx| {
-            let a_blob: Vec<u8> = ctx.get(0)?;
-            let b_blob: Vec<u8> = ctx.get(1)?;
-
-            let a = blob_to_floats(&a_blob);
-            let b = blob_to_floats(&b_blob);
-
-            if a.len() != b.len() || a.is_empty() {
-                return Ok(1.0f64); // maximum distance — treat as no match
-            }
-
-            let mut dot  = 0.0f64;
-            let mut na   = 0.0f64;
-            let mut nb   = 0.0f64;
-
-            for i in 0..a.len() {
-                let fa = a[i] as f64;
-                let fb = b[i] as f64;
-                dot += fa * fb;
-                na  += fa * fa;
-                nb  += fb * fb;
-            }
-
-            let denom = na.sqrt() * nb.sqrt();
-            if denom < 1e-10 {
-                return Ok(1.0f64);
-            }
-
-            // distance = 1 − similarity  ∈ [0, 2]  (normalised vecs → [0, 1])
-            Ok(1.0 - dot / denom)
-        },
-    )?;
-
-    Ok(())
+/// Attempt to load the sqlite-vec extension into an open connection.
+///
+/// sqlite-vec provides `vec_distance_cosine(a, b)` and related functions
+/// for SQL-level vector similarity queries. Our existing BLOB format
+/// (raw little-endian f32 bytes) is wire-compatible with sqlite-vec's
+/// expected input, so no data migration is required.
+///
+/// Loading is best-effort: if the extension fails to register (e.g. due
+/// to a build environment that excludes dynamic extension loading),
+/// the application continues normally and the JS-side cosine similarity
+/// in useEmbeddings.ts is used as a fallback.
+fn try_load_sqlite_vec(conn: &Connection) {
+    unsafe {
+        let rc = sqlite_vec::sqlite3_auto_init(
+            conn.handle(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        if rc != 0 {
+            eprintln!(
+                "[PromptVault] sqlite-vec extension failed to load (rc={}). \
+                 SQL vector search unavailable; JS-side similarity is the fallback.",
+                rc
+            );
+        }
+    }
 }
 
 // ─── Database Implementation ─────────────────────────────────────
@@ -157,10 +124,9 @@ impl Database {
         let path = db_path();
         let conn = Connection::open(&path)?;
 
-        // Register custom SQL functions before any other operation.
-        // These are connection-level registrations and are unaffected by
-        // the database's encryption state, so they survive apply_key().
-        register_vec_functions(&conn)?;
+        // Load sqlite-vec before any other setup so vec_* functions are
+        // available for the schema initialisation queries if needed.
+        try_load_sqlite_vec(&conn);
 
         // Enable WAL mode for better concurrent read performance
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
@@ -473,7 +439,6 @@ impl Database {
         }
 
         if let Some(c) = content {
-            // Get next version number
             let next_version: i32 = self.conn.query_row(
                 "SELECT COALESCE(MAX(version_number), 0) + 1 FROM prompt_versions WHERE prompt_id = ?1",
                 params![id],
@@ -491,7 +456,6 @@ impl Database {
                 params![now, id],
             )?;
 
-            // Rebuild FTS entry
             let current_title: String = self.conn.query_row(
                 "SELECT title FROM prompts WHERE id = ?1", params![id], |row| row.get(0),
             )?;
@@ -558,14 +522,12 @@ impl Database {
     }
 
     fn set_tags_for_prompt(&self, prompt_id: i64, tags: &[String]) -> Result<()> {
-        // Clear existing
         self.conn.execute(
             "DELETE FROM prompt_tags WHERE prompt_id = ?1",
             params![prompt_id],
         )?;
 
         for tag_name in tags {
-            // Upsert tag
             self.conn.execute(
                 "INSERT OR IGNORE INTO tags (name) VALUES (?1)",
                 params![tag_name],
@@ -586,7 +548,6 @@ impl Database {
     // ── Search ───────────────────────────────────────────────────
 
     pub fn search_prompts(&self, query: &str) -> Result<Vec<Prompt>> {
-        // Use FTS5 for keyword search
         let fts_query = query
             .split_whitespace()
             .map(|w| format!("\"{}\"", w.replace('"', "")))
@@ -628,81 +589,6 @@ impl Database {
             });
         }
         Ok(result)
-    }
-
-    // ── SQL-native Similarity Search (Phase 6) ────────────────────
-    //
-    // Uses the vec_cosine_distance() scalar function registered at
-    // connection time to perform cosine similarity search entirely in
-    // SQL.  The JOIN on embeddings is indexed by (provider), so the scan
-    // is efficient even for large vaults.
-    //
-    // This replaces the previous approach of loading all vectors into
-    // JS and computing distances in-process, giving:
-    //   • Consistent results between sessions (DB is the source of truth)
-    //   • No memory spike for large vaults
-    //   • A clear migration path to sqlite-vec vec0 virtual tables
-
-    /// Find the `limit` most similar prompts to `query_vector` for a
-    /// given `provider`, ranked by cosine similarity (highest first).
-    ///
-    /// Returns an empty vec (not an error) when no embeddings are stored
-    /// for that provider — callers should fall back to keyword search.
-    pub fn similarity_search(
-        &self,
-        query_vector: &[f32],
-        provider: &str,
-        limit: i64,
-    ) -> Result<Vec<SimilarityResult>> {
-        if query_vector.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let query_blob = floats_to_blob(query_vector);
-
-        let mut stmt = self.conn.prepare(
-            "SELECT p.id, p.title, p.category_id, p.created_at, p.updated_at,
-                    COALESCE(pv.content_text, '') AS content,
-                    vec_cosine_distance(e.vector, ?1) AS distance
-             FROM prompts p
-             JOIN embeddings e ON e.prompt_id = p.id AND e.provider = ?2
-             LEFT JOIN prompt_versions pv ON pv.id = (
-                 SELECT id FROM prompt_versions WHERE prompt_id = p.id
-                 ORDER BY version_number DESC LIMIT 1
-             )
-             ORDER BY distance ASC
-             LIMIT ?3"
-        )?;
-
-        let rows = stmt
-            .query_map(params![query_blob, provider, limit], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<i64>>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, f64>(6)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>>>()?;
-
-        let mut results = Vec::new();
-        for (id, title, category_id, created_at, updated_at, content, distance) in rows {
-            let tags = self.get_tags_for_prompt(id)?;
-            results.push(SimilarityResult {
-                prompt_id: id,
-                title,
-                content,
-                category_id,
-                tags,
-                created_at,
-                updated_at,
-                score: (1.0 - distance).max(0.0), // similarity = 1 − distance
-            });
-        }
-        Ok(results)
     }
 
     // ── Embeddings ───────────────────────────────────────────────
@@ -769,15 +655,70 @@ impl Database {
         Ok(count)
     }
 
+    // ── SQL Vector Search (Phase 6) ───────────────────────────────
+    //
+    // Uses sqlite-vec's `vec_distance_cosine(a, b)` function, which must have
+    // been loaded via `try_load_sqlite_vec` at connection open time.
+    //
+    // vec_distance_cosine returns a cosine *distance* in [0, 2] (0 = identical
+    // direction, 2 = opposite).  We convert to a similarity score in [0, 1]:
+    //   similarity = max(0, 1 - distance)
+    //
+    // Results are ordered most-similar first (smallest distance ascending).
+    // This is equivalent to the JS-side cosine similarity in useEmbeddings.ts,
+    // but runs entirely in SQLite with no round-trip to the frontend.
+    //
+    // Falls back gracefully: if sqlite-vec didn't load, this query will fail
+    // with "no such function: vec_distance_cosine", which the Tauri command
+    // converts to an error that the frontend catches and handles by using the
+    // existing JS-side search instead.
+
+    /// Find the `top_k` most-similar embeddings to `query_vector` for the given
+    /// provider, using SQL-level cosine distance.
+    ///
+    /// Returns `(prompt_id, similarity)` pairs ordered by descending similarity.
+    pub fn vector_search(
+        &self,
+        query_vector: &[f32],
+        provider: &str,
+        top_k: usize,
+    ) -> Result<Vec<VectorSearchResult>> {
+        let blob = floats_to_blob(query_vector);
+        let mut stmt = self.conn.prepare(
+            "SELECT prompt_id,
+                    CAST(vec_distance_cosine(vector, ?1) AS REAL) AS dist
+             FROM embeddings
+             WHERE provider = ?2
+               AND dimensions = ?3
+             ORDER BY dist ASC
+             LIMIT ?4"
+        )?;
+
+        let dims = query_vector.len() as i64;
+        let rows = stmt.query_map(params![blob, provider, dims, top_k as i64], |row| {
+            let prompt_id: i64 = row.get(0)?;
+            let dist: f64 = row.get(1)?;
+            // Convert cosine distance [0, 2] → similarity [0, 1]
+            let similarity = ((1.0 - dist) as f32).max(0.0);
+            Ok(VectorSearchResult { prompt_id, similarity })
+        })?;
+
+        rows.collect()
+    }
+
     // ── SQLCipher key management ──────────────────────────────────
 
+    /// Apply the SQLCipher decryption key to this connection.
+    ///
+    /// **Must be called before any other statement on an encrypted database.**
+    /// Returns `Err` if the key is wrong (subsequent sqlite_master read fails).
     pub fn apply_key(&self, key_hex: &str) -> Result<()> {
         self.conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";\n", key_hex))?;
-        // Verify by touching the schema — SQLCipher returns SQLITE_NOTADB on bad key.
         self.conn.execute_batch("SELECT count(*) FROM sqlite_master;")?;
         Ok(())
     }
 
+    /// Re-key the database (encrypt plaintext DB, change key, or remove encryption).
     pub fn rekey(&self, new_key_hex: Option<&str>) -> Result<()> {
         let pragma = match new_key_hex {
             Some(hex) => format!("PRAGMA rekey = \"x'{}'\";", hex),
@@ -789,12 +730,13 @@ impl Database {
 
     // ── Conflict resolution ───────────────────────────────────────
 
+    /// Replace the contents of the live database connection with those from a
+    /// SQLite file at `source_path`, using SQLite's online backup API.
     pub fn restore_from(&mut self, source_path: &str) -> Result<()> {
         use rusqlite::backup::{Backup, StepResult};
         use std::time::Duration;
 
         let src = Connection::open(source_path)?;
-
         let backup = Backup::new(&src, &mut self.conn)?;
 
         loop {
