@@ -1,54 +1,46 @@
 import { useState } from "react";
-import { exportPrompts } from "../api/commands";
-import type { Prompt } from "../types";
+import { getExportData } from "../api/commands";
 
 interface ExportDialogProps {
-  prompts: Prompt[];
-  /** IDs of currently selected / open prompts. null = export all */
-  selectedIds?: number[] | null;
+  promptCount: number;
   onClose: () => void;
 }
 
-type Format = "json" | "markdown";
-type Scope  = "all" | "selected";
+type ExportFormat = "json" | "markdown";
 
-function downloadBlob(content: string, filename: string, mimeType: string) {
-  const blob = new Blob([content], { type: mimeType });
-  const url  = URL.createObjectURL(blob);
-  const a    = document.createElement("a");
-  a.href     = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
-}
-
-export default function ExportDialog({ prompts, selectedIds, onClose }: ExportDialogProps) {
-  const [format, setFormat]     = useState<Format>("json");
-  const [scope, setScope]       = useState<Scope>("all");
+export default function ExportDialog({ promptCount, onClose }: ExportDialogProps) {
+  const [format, setFormat] = useState<ExportFormat>("markdown");
   const [exporting, setExporting] = useState(false);
-  const [error, setError]       = useState<string | null>(null);
-
-  const hasSelection = selectedIds && selectedIds.length > 0;
-  const exportCount  = scope === "selected" && hasSelection
-    ? selectedIds!.length
-    : prompts.length;
+  const [error, setError] = useState<string | null>(null);
 
   const handleExport = async () => {
     setExporting(true);
     setError(null);
 
     try {
-      const ids = scope === "selected" && hasSelection ? selectedIds! : null;
-      const content = await exportPrompts({ format, ids });
+      const data = await getExportData(format);
 
-      const date = new Date().toISOString().split("T")[0];
-      if (format === "json") {
-        downloadBlob(content, `promptvault-export-${date}.json`, "application/json");
-      } else {
-        downloadBlob(content, `promptvault-export-${date}.md`, "text/markdown");
-      }
+      // Build a Blob and trigger a browser-style download.
+      // Works in both Tauri (webview) and browser dev mode.
+      const mimeType = format === "json" ? "application/json" : "text/markdown";
+      const extension = format === "json" ? "json" : "md";
+      const filename = `promptvault_export_${new Date()
+        .toISOString()
+        .slice(0, 10)}.${extension}`;
+
+      const blob = new Blob([data], { type: mimeType });
+      const url = URL.createObjectURL(blob);
+
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = filename;
+      anchor.style.display = "none";
+      document.body.appendChild(anchor);
+      anchor.click();
+      document.body.removeChild(anchor);
+
+      // Clean up the object URL after a short delay
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
 
       onClose();
     } catch (e) {
@@ -58,25 +50,42 @@ export default function ExportDialog({ prompts, selectedIds, onClose }: ExportDi
     }
   };
 
+  const formatInfo: Record<ExportFormat, { label: string; icon: string; description: string }> = {
+    json: {
+      label: "JSON",
+      icon: "{}",
+      description:
+        "Structured export with all metadata — prompts, categories, tags, timestamps. " +
+        "Ideal for importing into other tools or scripting.",
+    },
+    markdown: {
+      label: "Markdown",
+      icon: "##",
+      description:
+        "A single human-readable Markdown file with one section per prompt. " +
+        "Ideal for sharing, reading, or archiving without PromptVault.",
+    },
+  };
+
   return (
     <div
-      className="fixed inset-0 z-50 flex items-start justify-center pt-[14vh]"
+      className="fixed inset-0 z-50 flex items-start justify-center pt-[15vh]"
       onClick={onClose}
     >
       <div className="absolute inset-0 bg-black/50" />
 
       <div
-        className="relative w-full max-w-sm bg-darcula-bg-light border border-darcula-border rounded-lg shadow-2xl overflow-hidden"
+        className="relative w-full max-w-md bg-darcula-bg-light border border-darcula-border rounded-lg shadow-2xl overflow-hidden"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
-        <div className="px-4 py-3 border-b border-darcula-border flex items-center justify-between">
+        <div className="flex items-center justify-between px-4 py-3 border-b border-darcula-border">
           <div>
             <h2 className="text-sm font-mono font-semibold text-darcula-text-bright">
-              ↗ Export Prompts
+              ↓ Export Prompts
             </h2>
             <p className="text-2xs font-mono text-darcula-text-muted mt-0.5">
-              Download your prompts as a file
+              {promptCount} prompt{promptCount !== 1 ? "s" : ""} will be exported
             </p>
           </div>
           <button
@@ -87,82 +96,87 @@ export default function ExportDialog({ prompts, selectedIds, onClose }: ExportDi
           </button>
         </div>
 
-        <div className="px-4 py-4 space-y-4">
-          {/* Format selector */}
-          <div>
-            <label className="text-2xs font-mono text-darcula-text-muted uppercase tracking-wider block mb-2">
-              Format
-            </label>
-            <div className="flex gap-2">
-              {(["json", "markdown"] as Format[]).map((f) => (
-                <button
-                  key={f}
-                  className={`flex-1 text-xs font-mono px-3 py-2 rounded-sm border transition-colors ${
-                    format === f
-                      ? "border-darcula-accent bg-darcula-accent/20 text-darcula-accent-bright"
-                      : "border-darcula-border text-darcula-text-muted hover:border-darcula-accent/50 hover:text-darcula-text"
+        {/* Format Selection */}
+        <div className="px-4 py-4 space-y-2">
+          <label className="text-2xs font-mono text-darcula-text-muted uppercase tracking-wider block mb-3">
+            Export Format
+          </label>
+
+          {(Object.entries(formatInfo) as [ExportFormat, typeof formatInfo.json][]).map(
+            ([key, info]) => (
+              <button
+                key={key}
+                className={`w-full flex items-start gap-3 p-3 rounded-sm border text-left transition-colors ${
+                  format === key
+                    ? "border-darcula-accent bg-darcula-accent/10"
+                    : "border-darcula-border hover:border-darcula-accent/40 hover:bg-darcula-bg-lighter"
+                }`}
+                onClick={() => setFormat(key)}
+              >
+                {/* Format icon */}
+                <span
+                  className={`flex-shrink-0 w-8 h-8 rounded-sm flex items-center justify-center text-xs font-mono font-bold ${
+                    format === key
+                      ? "bg-darcula-accent text-white"
+                      : "bg-darcula-bg text-darcula-text-muted"
                   }`}
-                  onClick={() => setFormat(f)}
                 >
-                  {f === "json" ? "📋 JSON" : "📄 Markdown"}
-                </button>
-              ))}
-            </div>
-            <p className="text-2xs font-mono text-darcula-text-muted mt-1.5">
-              {format === "json"
-                ? "Structured JSON with full metadata and version history. Ideal for re-importing or programmatic use."
-                : "Human-readable Markdown document. One section per prompt with YAML-style metadata."}
+                  {info.icon}
+                </span>
+
+                <div className="min-w-0">
+                  <div
+                    className={`text-xs font-mono font-semibold ${
+                      format === key ? "text-darcula-accent-bright" : "text-darcula-text"
+                    }`}
+                  >
+                    {info.label}
+                  </div>
+                  <div className="text-2xs font-mono text-darcula-text-muted mt-0.5 leading-relaxed">
+                    {info.description}
+                  </div>
+                </div>
+
+                {/* Selected indicator */}
+                {format === key && (
+                  <span className="flex-shrink-0 w-4 h-4 rounded-full bg-darcula-accent flex items-center justify-center ml-auto mt-1">
+                    <span className="text-white text-xs">✓</span>
+                  </span>
+                )}
+              </button>
+            )
+          )}
+        </div>
+
+        {/* Error */}
+        {error && (
+          <div className="px-4 pb-2">
+            <p className="text-2xs font-mono text-darcula-error bg-darcula-error/10 px-3 py-2 rounded-sm">
+              {error}
             </p>
           </div>
+        )}
 
-          {/* Scope selector */}
-          <div>
-            <label className="text-2xs font-mono text-darcula-text-muted uppercase tracking-wider block mb-2">
-              Scope
-            </label>
-            <div className="flex gap-2">
-              <button
-                className={`flex-1 text-xs font-mono px-3 py-2 rounded-sm border transition-colors ${
-                  scope === "all"
-                    ? "border-darcula-accent bg-darcula-accent/20 text-darcula-accent-bright"
-                    : "border-darcula-border text-darcula-text-muted hover:border-darcula-accent/50"
-                }`}
-                onClick={() => setScope("all")}
-              >
-                All ({prompts.length})
-              </button>
-              <button
-                className={`flex-1 text-xs font-mono px-3 py-2 rounded-sm border transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
-                  scope === "selected"
-                    ? "border-darcula-accent bg-darcula-accent/20 text-darcula-accent-bright"
-                    : "border-darcula-border text-darcula-text-muted hover:border-darcula-accent/50"
-                }`}
-                onClick={() => setScope("selected")}
-                disabled={!hasSelection}
-                title={!hasSelection ? "No prompts selected" : undefined}
-              >
-                Selected ({hasSelection ? selectedIds!.length : 0})
-              </button>
-            </div>
+        {/* Actions */}
+        <div className="flex items-center justify-between px-4 py-3 border-t border-darcula-border">
+          <p className="text-2xs font-mono text-darcula-text-muted">
+            File will download automatically
+          </p>
+          <div className="flex gap-2">
+            <button
+              className="text-xs font-mono px-3 py-1.5 rounded-sm text-darcula-text-muted hover:text-darcula-text transition-colors"
+              onClick={onClose}
+            >
+              Cancel
+            </button>
+            <button
+              className="text-xs font-mono px-4 py-1.5 rounded-sm bg-darcula-accent text-white hover:bg-darcula-accent-bright transition-colors disabled:opacity-50"
+              onClick={handleExport}
+              disabled={exporting}
+            >
+              {exporting ? "Exporting…" : `Export as ${formatInfo[format].label}`}
+            </button>
           </div>
-
-          {/* Error */}
-          {error && (
-            <div className="px-3 py-2 bg-darcula-error/10 border border-darcula-error/30 rounded-sm">
-              <p className="text-2xs font-mono text-darcula-error">{error}</p>
-            </div>
-          )}
-
-          {/* Export button */}
-          <button
-            className="w-full text-xs font-mono px-3 py-2.5 rounded-sm bg-darcula-accent text-white hover:bg-darcula-accent-bright transition-colors disabled:opacity-50"
-            onClick={handleExport}
-            disabled={exporting || exportCount === 0}
-          >
-            {exporting
-              ? "Exporting…"
-              : `Export ${exportCount} prompt${exportCount !== 1 ? "s" : ""} as .${format === "json" ? "json" : "md"}`}
-          </button>
         </div>
       </div>
     </div>
