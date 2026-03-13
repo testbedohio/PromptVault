@@ -15,14 +15,19 @@ tauri = { version = "2", features = [] }
 tauri-plugin-shell = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rusqlite = { version = "0.31", features = ["bundled"] }
+# SQLCipher replaces plain SQLite; OpenSSL is vendored so no system dep is required.
+# Existing plaintext DBs continue to work until the user opts in to encryption.
+rusqlite = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl", "backup"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 dirs = "5"
 reqwest = { version = "0.12", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
+# Argon2id key derivation: password -> 32-byte SQLCipher key
+argon2 = "0.5"
+# CSPRNG for salt generation (getrandom is already a transitive dep via uuid/v4)
+getrandom = "0.2"
 # sqlite-vec: compiled-in vector extension for SQLite.
-# Crate is present for future SQL-level vec queries (vec_distance_cosine, etc.).
-# Extension init is deferred to Phase 5 when we add SQL similarity search.
+# Extension init is deferred to Phase 6 when we add SQL similarity search.
 # Raw f32 BLOB storage used now is wire-compatible with sqlite-vec's format.
 sqlite-vec = "0"
