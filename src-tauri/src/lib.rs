@@ -5,7 +5,8 @@ use db::{Database, Prompt, PromptVersion, Category, Tag, StoredEmbedding};
 use sync::{DriveSync, SyncConfig, SyncStatus};
 use chrono::DateTime;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex as StdMutex, atomic::{AtomicBool, Ordering}};
 use tokio::sync::{watch, Mutex as TokioMutex};
 use tokio::time::{sleep, Duration};
 use tauri::State;
@@ -78,16 +79,71 @@ async fn run_sync_worker(
 
 /// Shared application state managed by Tauri.
 ///
-/// `db`   — std::sync::Mutex  (synchronous commands only, never held across .await)
-/// `sync` — Arc<tokio::sync::Mutex> so the Arc can be cloned into spawned tasks
-/// `db_path` — captured once at startup to avoid re-locking `db` in the worker
-/// `sync_worker_tx` — watch sender for updating the background worker's config
-///                    without stopping/restarting it
+/// `db`            — std::sync::Mutex  (sync commands only, never held across .await)
+/// `sync`          — Arc<tokio::sync::Mutex> (async, cloneable into spawned tasks)
+/// `db_path`       — captured once at startup; passed to the sync worker
+/// `sync_worker_tx`— watch channel sender for live worker config updates
+/// `db_locked`     — true when DB is encrypted but key not yet applied this session
 struct AppState {
     db: StdMutex<Database>,
     sync: Arc<TokioMutex<DriveSync>>,
     db_path: String,
     sync_worker_tx: Arc<watch::Sender<SyncWorkerCtl>>,
+    db_locked: Arc<AtomicBool>,
+}
+
+// ─── Crypto Helpers ───────────────────────────────────────────────────────────
+//
+// Salt file layout:  <app_data>/PromptVault/db.salt  (64 hex chars, no newline)
+// Key derivation:    Argon2id, 64 MB memory, 3 iterations → 32-byte key
+// SQLCipher format:  PRAGMA key = "x'<64-hex-chars>'"
+
+fn salt_path() -> PathBuf {
+    let mut p = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
+    p.push("PromptVault");
+    std::fs::create_dir_all(&p).ok();
+    p.push("db.salt");
+    p
+}
+
+/// Returns `true` when a salt file is present, indicating the DB is encrypted.
+fn is_encrypted_on_disk() -> bool {
+    salt_path().exists()
+}
+
+fn bytes_to_hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{:02x}", x)).collect()
+}
+
+/// Derive a 32-byte SQLCipher key from a UTF-8 password and a 32-byte salt.
+/// Uses Argon2id with 64 MB memory and 3 iterations.
+fn derive_key(password: &str, salt: &[u8]) -> Result<String, String> {
+    use argon2::{Argon2, Algorithm, Version, Params};
+    let params = Params::new(65536, 3, 4, Some(32))
+        .map_err(|e| e.to_string())?;
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut key = [0u8; 32];
+    argon2.hash_password_into(password.as_bytes(), salt, &mut key)
+        .map_err(|e| e.to_string())?;
+    Ok(bytes_to_hex(&key))
+}
+
+/// Load the persisted salt from disk.
+fn load_salt() -> Result<Vec<u8>, String> {
+    let hex = std::fs::read_to_string(salt_path()).map_err(|e| e.to_string())?;
+    let clean = hex.trim();
+    (0..clean.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&clean[i..i+2], 16).map_err(|e| e.to_string()))
+        .collect()
+}
+
+/// Generate a fresh 32-byte random salt and persist it to disk.
+fn create_salt() -> Result<Vec<u8>, String> {
+    let mut salt = vec![0u8; 32];
+    getrandom::getrandom(&mut salt).map_err(|e| e.to_string())?;
+    std::fs::write(salt_path(), bytes_to_hex(&salt)).map_err(|e| e.to_string())?;
+    Ok(salt)
 }
 
 // ─── Response Wrappers ───────────────────────────────────────────
@@ -594,6 +650,134 @@ async fn resolve_conflict(
     }
 }
 
+// ─── Encryption Commands ─────────────────────────────────────────────────────
+
+/// Returns whether the database file is currently encrypted (salt file present)
+/// and whether the key has been applied this session.
+///
+/// The frontend calls this once on startup to decide whether to show the
+/// unlock dialog.
+#[derive(Serialize)]
+struct DbLockStatus {
+    /// True when the DB is encrypted (salt file exists on disk).
+    encrypted: bool,
+    /// True when the encryption key has been applied this session.
+    /// Always `true` when `encrypted` is `false`.
+    unlocked: bool,
+}
+
+#[tauri::command]
+fn get_db_lock_status(state: State<AppState>) -> ApiResult<DbLockStatus> {
+    let encrypted = is_encrypted_on_disk();
+    let unlocked  = !state.db_locked.load(Ordering::SeqCst);
+    ok(DbLockStatus { encrypted, unlocked })
+}
+
+/// Unlock an encrypted database using the master password.
+///
+/// Derives the SQLCipher key from the stored salt + password (Argon2id),
+/// applies it to the live connection, and verifies by reading `sqlite_master`.
+/// On success, clears the `db_locked` flag so normal commands can proceed.
+///
+/// Returns an error (without changing state) if the password is wrong.
+#[tauri::command]
+fn unlock_database(password: String, state: State<AppState>) -> ApiResult<bool> {
+    // Load salt — if absent the DB isn't encrypted, nothing to unlock.
+    let salt = match load_salt() {
+        Ok(s) => s,
+        Err(_) => {
+            state.db_locked.store(false, Ordering::SeqCst);
+            return ok(true);
+        }
+    };
+
+    let key_hex = match derive_key(&password, &salt) {
+        Ok(k) => k,
+        Err(e) => return err(&e),
+    };
+
+    let db = state.db.lock().unwrap();
+    match db.apply_key(&key_hex) {
+        Ok(_) => {
+            state.db_locked.store(false, Ordering::SeqCst);
+            ok(true)
+        }
+        Err(_) => err("Incorrect password"),
+    }
+}
+
+/// Set, change, or remove the master password.
+///
+/// | `current`    | `new_password` | Effect                                         |
+/// |--------------|----------------|------------------------------------------------|
+/// | `None`       | `Some(pw)`     | Enable encryption on a plaintext DB            |
+/// | `Some(old)`  | `Some(new)`    | Change the password (re-key)                   |
+/// | `Some(old)`  | `None`         | Remove encryption (decrypt to plaintext)        |
+///
+/// If the DB is currently encrypted, `current` must be provided and correct.
+/// The caller should ensure the DB is **unlocked** before invoking this command.
+#[tauri::command]
+fn set_db_password(
+    current: Option<String>,
+    new_password: Option<String>,
+    state: State<AppState>,
+) -> ApiResult<bool> {
+    let db = state.db.lock().unwrap();
+
+    // ── Verify + apply existing key (if encrypted) ───────────────
+    if is_encrypted_on_disk() {
+        let old_pw = match &current {
+            Some(pw) => pw,
+            None => return err("Current password required to change or remove encryption"),
+        };
+        let salt = match load_salt() {
+            Ok(s) => s,
+            Err(e) => return err(&e),
+        };
+        let old_key = match derive_key(old_pw, &salt) {
+            Ok(k) => k,
+            Err(e) => return err(&e),
+        };
+        if let Err(_) = db.apply_key(&old_key) {
+            return err("Incorrect current password");
+        }
+    }
+
+    match &new_password {
+        Some(new_pw) => {
+            // Generate fresh salt, derive new key, re-key the DB.
+            let new_salt = match create_salt() {
+                Ok(s) => s,
+                Err(e) => return err(&e),
+            };
+            let new_key = match derive_key(new_pw, &new_salt) {
+                Ok(k) => k,
+                Err(e) => {
+                    // Salt was already written; clean up on failure
+                    let _ = std::fs::remove_file(salt_path());
+                    return err(&e);
+                }
+            };
+            if let Err(e) = db.rekey(Some(&new_key)) {
+                let _ = std::fs::remove_file(salt_path());
+                return err(&e.to_string());
+            }
+            // DB is now unlocked with the new key
+            state.db_locked.store(false, Ordering::SeqCst);
+            ok(true)
+        }
+        None => {
+            // Remove encryption
+            if let Err(e) = db.rekey(None) {
+                return err(&e.to_string());
+            }
+            let _ = std::fs::remove_file(salt_path());
+            state.db_locked.store(false, Ordering::SeqCst);
+            ok(true)
+        }
+    }
+}
+
 // ─── App Entry ───────────────────────────────────────────────────
 
 pub fn run() {
@@ -611,8 +795,12 @@ pub fn run() {
     let (worker_tx, worker_rx) = watch::channel(initial_ctl);
     let sync_arc = Arc::new(TokioMutex::new(sync));
 
+    // The DB starts locked whenever a salt file is present (encryption enabled).
+    // The frontend will show the unlock dialog and call `unlock_database` before
+    // any data commands.
+    let db_locked = Arc::new(AtomicBool::new(is_encrypted_on_disk()));
+
     // Spawn the background sync worker — it runs for the entire app lifetime.
-    // The worker idles until auto_sync_enabled is true.
     let worker_sync = Arc::clone(&sync_arc);
     let worker_db_path = db_path.clone();
     tokio::spawn(run_sync_worker(worker_sync, worker_db_path, worker_rx));
@@ -624,6 +812,7 @@ pub fn run() {
             sync: sync_arc,
             db_path,
             sync_worker_tx: Arc::new(worker_tx),
+            db_locked,
         })
         .invoke_handler(tauri::generate_handler![
             get_categories,
@@ -649,6 +838,9 @@ pub fn run() {
             set_auto_sync,
             get_conflict_info,
             resolve_conflict,
+            get_db_lock_status,
+            unlock_database,
+            set_db_password,
         ])
         .run(tauri::generate_context!())
         .expect("error while running PromptVault");
