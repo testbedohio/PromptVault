@@ -758,8 +758,9 @@ fn set_shortcut(action: String, accelerator: String) -> ApiResult<bool> {
     }
 
     if accelerator.is_empty() {
-        // Reset to default
-        shortcuts.insert(action, defaults[&action.as_str() as &str].clone());
+        // Reset to default — clone key before move
+        let default_val = defaults.get(action.as_str()).cloned().unwrap_or_default();
+        shortcuts.insert(action, default_val);
     } else {
         shortcuts.insert(action, accelerator);
     }
