@@ -464,6 +464,55 @@ impl DriveSync {
         Ok(())
     }
 
+    /// Download the remote database file to `dest_path`.
+    ///
+    /// Used by `resolve_conflict` when the user chooses "Accept Newest" and
+    /// the remote turns out to be newer. The caller (lib.rs) then calls
+    /// `db.restore_from(dest_path)` to swap the live connection's contents.
+    ///
+    /// `dest_path` should be a sibling of the live DB (e.g. `.../prompt_vault_incoming.db`)
+    /// so that it lands on the same filesystem and cleanup is trivial.
+    pub async fn download_db(&mut self, dest_path: &str) -> Result<(), String> {
+        self.ensure_fresh_token().await?;
+
+        let token = self
+            .config
+            .access_token
+            .as_ref()
+            .ok_or("Not authenticated")?
+            .clone();
+
+        let file_id = self
+            .config
+            .remote_file_id
+            .as_ref()
+            .ok_or("No remote file ID — cannot download")?
+            .clone();
+
+        let client = reqwest::Client::new();
+        let url = format!(
+            "https://www.googleapis.com/drive/v3/files/{}?alt=media",
+            file_id
+        );
+
+        let response = client
+            .get(&url)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if !response.status().is_success() {
+            let err = response.text().await.unwrap_or_default();
+            return Err(format!("Download failed: {}", err));
+        }
+
+        let bytes = response.bytes().await.map_err(|e| e.to_string())?;
+        fs::write(dest_path, &bytes).map_err(|e| e.to_string())?;
+
+        Ok(())
+    }
+
     /// Check whether the remote file is newer than the last local sync.
     /// Returns the remote ISO 8601 modifiedTime string if the file exists.
     pub async fn check_remote_status(&self) -> Result<Option<String>, String> {
