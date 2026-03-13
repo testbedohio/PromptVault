@@ -10,7 +10,9 @@ import NewPromptDialog from "./components/NewPromptDialog";
 import BrainSelector from "./components/BrainSelector";
 import SyncPanel from "./components/SyncPanel";
 import ConflictDialog from "./components/ConflictDialog";
-import { getConflictInfo, getSyncConfig, isSyncConnected, type ConflictInfo } from "./api/commands";
+import UnlockDialog from "./components/UnlockDialog";
+import SetPasswordDialog from "./components/SetPasswordDialog";
+import { getConflictInfo, getSyncConfig, isSyncConnected, getDbLockStatus, type ConflictInfo } from "./api/commands";
 
 export default function App() {
   // Panel widths
@@ -25,6 +27,14 @@ export default function App() {
   const [syncPanelOpen, setSyncPanelOpen] = useState(false);
   const [conflict, setConflict] = useState<ConflictInfo | null>(null);
 
+  // Encryption state
+  // "checking" → waiting for getDbLockStatus on mount
+  // "locked"   → DB is encrypted, UnlockDialog is shown
+  // "unlocked" → key applied (or DB is plaintext), normal app flow
+  const [lockState, setLockState]           = useState<"checking" | "locked" | "unlocked">("checking");
+  const [isEncrypted, setIsEncrypted]       = useState(false);
+  const [setPasswordOpen, setSetPasswordOpen] = useState(false);
+
   // Data from Tauri backend (or browser fallback)
   const {
     prompts,
@@ -34,6 +44,7 @@ export default function App() {
     loading,
     dbConnected,
     tauri,
+    reload,
     addPrompt,
     savePrompt,
     removePrompt,
@@ -50,7 +61,22 @@ export default function App() {
   const [selectedCategory, setSelectedCategory] = useState<number | null>(null);
   const [activeTagFilter, setActiveTagFilter] = useState<string | null>(null);
 
-  // Open first prompt when data loads
+  // Check encryption/lock status on mount — before conflict check or embedding restore.
+  useEffect(() => {
+    getDbLockStatus()
+      .then((status) => {
+        setIsEncrypted(status.encrypted);
+        setLockState(status.unlocked ? "unlocked" : "locked");
+        if (status.unlocked && !status.encrypted) {
+          // Plaintext — trigger data load immediately
+          reload();
+        }
+      })
+      .catch(() => {
+        // Browser / Tauri unavailable — treat as unlocked
+        setLockState("unlocked");
+      });
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     if (prompts.length > 0 && openTabs.length === 0) {
       setOpenTabs([prompts[0].id]);
@@ -204,6 +230,26 @@ export default function App() {
     return () => window.removeEventListener("keydown", handler);
   }, []);
 
+  // ── Render: unlock gate (full-screen, blocks everything else) ────
+  if (lockState === "checking") {
+    return (
+      <div className="flex items-center justify-center h-screen w-screen bg-darcula-bg">
+        <div className="text-4xl animate-pulse text-darcula-accent-bright">⬡</div>
+      </div>
+    );
+  }
+
+  if (lockState === "locked") {
+    return (
+      <UnlockDialog
+        onUnlocked={() => {
+          setLockState("unlocked");
+          reload();
+        }}
+      />
+    );
+  }
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-screen w-screen bg-darcula-bg">
@@ -258,6 +304,13 @@ export default function App() {
             title="Google Drive Sync"
           >
             ☁
+          </button>
+          <button
+            className="hover:text-darcula-text transition-colors"
+            onClick={() => setSetPasswordOpen(true)}
+            title={isEncrypted ? "Database encrypted — manage password" : "Enable database encryption"}
+          >
+            {isEncrypted ? "🔒" : "🔓"}
           </button>
           <button
             className="hover:text-darcula-text transition-colors"
@@ -385,6 +438,17 @@ export default function App() {
             }
           }}
           onDismiss={() => setConflict(null)}
+        />
+      )}
+
+      {setPasswordOpen && (
+        <SetPasswordDialog
+          isEncrypted={isEncrypted}
+          onClose={() => setSetPasswordOpen(false)}
+          onChanged={() => {
+            setSetPasswordOpen(false);
+            getDbLockStatus().then((s) => setIsEncrypted(s.encrypted)).catch(() => {});
+          }}
         />
       )}
     </div>
