@@ -647,37 +647,29 @@ impl Database {
     }
 
     pub fn get_all_embeddings(&self, provider_filter: Option<&str>) -> Result<Vec<StoredEmbedding>> {
-        let rows = if let Some(provider) = provider_filter {
-            let mut stmt = self.conn.prepare(
-                "SELECT prompt_id, vector, model, provider
-                 FROM embeddings
-                 WHERE provider = ?1"
-            )?;
-            stmt.query_map(params![provider], |row| {
-                let blob: Vec<u8> = row.get(1)?;
-                Ok(StoredEmbedding {
-                    prompt_id: row.get(0)?,
-                    vector: blob_to_floats(&blob),
-                    model: row.get(2)?,
-                    provider: row.get(3)?,
-                })
-            })?
-            .collect::<Result<Vec<_>>>()?
-        } else {
-            let mut stmt = self.conn.prepare(
-                "SELECT prompt_id, vector, model, provider FROM embeddings"
-            )?;
-            stmt.query_map([], |row| {
-                let blob: Vec<u8> = row.get(1)?;
-                Ok(StoredEmbedding {
-                    prompt_id: row.get(0)?,
-                    vector: blob_to_floats(&blob),
-                    model: row.get(2)?,
-                    provider: row.get(3)?,
-                })
-            })?
-            .collect::<Result<Vec<_>>>()?
+        // Use a single query path to avoid stmt lifetime issues across if/else arms.
+        let sql_with = "SELECT prompt_id, vector, model, provider FROM embeddings WHERE provider = ?1";
+        let sql_all  = "SELECT prompt_id, vector, model, provider FROM embeddings";
+
+        let mut stmt_with = self.conn.prepare(sql_with)?;
+        let mut stmt_all  = self.conn.prepare(sql_all)?;
+
+        let map_row = |row: &rusqlite::Row<'_>| {
+            let blob: Vec<u8> = row.get(1)?;
+            Ok(StoredEmbedding {
+                prompt_id: row.get(0)?,
+                vector: blob_to_floats(&blob),
+                model: row.get(2)?,
+                provider: row.get(3)?,
+            })
         };
+
+        let rows: Vec<StoredEmbedding> = if let Some(provider) = provider_filter {
+            stmt_with.query_map(params![provider], map_row)?.collect::<Result<Vec<_>>>()?
+        } else {
+            stmt_all.query_map([], map_row)?.collect::<Result<Vec<_>>>()?
+        };
+
         Ok(rows)
     }
 
