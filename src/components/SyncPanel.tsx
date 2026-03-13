@@ -3,14 +3,17 @@ import {
   startOAuthFlow,
   startTeamOAuthFlow,
   connectTeamVault,
+  initSyncSession,
   getSyncConfig,
   syncToDrive,
+  resolveConflict,
   updateSyncConfig,
   setAutoSync,
   isSyncConnected,
   isSyncError,
   getSyncStatusLabel,
   type SyncConfig,
+  type SyncSessionInfo,
 } from "../api/commands";
 
 // Open a URL in the system browser.
@@ -54,6 +57,10 @@ export default function SyncPanel({ onClose }: SyncPanelProps) {
   const [syncing, setSyncing]           = useState(false);
   const [savingAutoSync, setSavingAutoSync] = useState(false);
 
+  // Multi-device: remote vault discovered banner
+  const [sessionInfo, setSessionInfo]   = useState<SyncSessionInfo | null>(null);
+  const [pullingRemote, setPullingRemote] = useState(false);
+
   // Team vault state
   const [teamVaultInput, setTeamVaultInput]   = useState("");
   const [connectingTeam, setConnectingTeam]   = useState(false);
@@ -87,7 +94,12 @@ export default function SyncPanel({ onClose }: SyncPanelProps) {
     timeoutRef.current = null;
   }, []);
 
-  const startPolling = useCallback(() => {
+  /**
+   * Poll getSyncConfig until Connected or Error.
+   * When Connected, run initSyncSession to discover/claim any existing remote
+   * file — the core multi-device fix.
+   */
+  const startPolling = useCallback((isTeamAuth = false) => {
     stopPolling();
 
     pollRef.current = setInterval(async () => {
@@ -99,6 +111,17 @@ export default function SyncPanel({ onClose }: SyncPanelProps) {
           setPhase("connected");
           setTeamAuthWaiting(false);
           stopPolling();
+
+          // ── Multi-device: discover existing remote file ──────────
+          try {
+            const session = await initSyncSession();
+            if (session.found_remote && session.remote_is_newer) {
+              setSessionInfo(session);
+            }
+          } catch {
+            // Non-fatal — user can still sync manually
+          }
+
         } else if (isSyncError(cfg)) {
           setPhase("error");
           setErrorMsg(getSyncStatusLabel(cfg));
@@ -112,15 +135,38 @@ export default function SyncPanel({ onClose }: SyncPanelProps) {
 
     timeoutRef.current = setTimeout(() => {
       stopPolling();
-      if (phase === "waiting" || teamAuthWaiting) {
+      if (phase === "waiting" || isTeamAuth) {
         setPhase("error");
         setTeamAuthWaiting(false);
         setErrorMsg("Sign-in timed out. Please try again.");
       }
     }, POLL_TIMEOUT_MS);
-  }, [stopPolling, phase, teamAuthWaiting]);
+  }, [stopPolling, phase]);
 
   useEffect(() => () => stopPolling(), [stopPolling]);
+
+  // ── Pull remote DB (multi-device) ────────────────────────────────
+
+  /**
+   * Accept the remote DB from another device — same last-write-wins flow
+   * used by ConflictDialog, but triggered from the session banner.
+   */
+  const handlePullRemote = async () => {
+    setPullingRemote(true);
+    try {
+      const result = await resolveConflict("accept_newest");
+      if (result.data_replaced) {
+        // Remote was pulled in — reload to flush stale React state
+        window.location.reload();
+      } else {
+        setSessionInfo(null);
+      }
+    } catch (e) {
+      setErrorMsg(e instanceof Error ? e.message : "Failed to pull remote database");
+    } finally {
+      setPullingRemote(false);
+    }
+  };
 
   // ── Personal Auth ────────────────────────────────────────────────
 
@@ -131,11 +177,12 @@ export default function SyncPanel({ onClose }: SyncPanelProps) {
 
     setPhase("waiting");
     setErrorMsg(null);
+    setSessionInfo(null);
 
     try {
       const authUrl = await startOAuthFlow(id, secret);
       await openUrl(authUrl);
-      startPolling();
+      startPolling(false);
     } catch (e) {
       setPhase("error");
       setErrorMsg(e instanceof Error ? e.message : String(e));
@@ -155,7 +202,7 @@ export default function SyncPanel({ onClose }: SyncPanelProps) {
     try {
       const authUrl = await startTeamOAuthFlow(id, secret);
       await openUrl(authUrl);
-      startPolling();
+      startPolling(true);
     } catch (e) {
       setTeamAuthWaiting(false);
       setErrorMsg(e instanceof Error ? e.message : String(e));
@@ -221,6 +268,7 @@ export default function SyncPanel({ onClose }: SyncPanelProps) {
       setConfig(reset);
       setPhase("idle");
       setTeamSection(false);
+      setSessionInfo(null);
       setErrorMsg(null);
     } catch (e) {
       setErrorMsg(e instanceof Error ? e.message : String(e));
@@ -279,7 +327,7 @@ export default function SyncPanel({ onClose }: SyncPanelProps) {
               ☁️ Google Drive Sync
             </h2>
             <p className="text-2xs font-mono text-darcula-text-muted mt-0.5">
-              Back up and share your prompt database
+              Back up and sync your prompt database
             </p>
           </div>
           <button className="text-darcula-text-muted hover:text-darcula-text text-sm" onClick={onClose}>
@@ -310,6 +358,38 @@ export default function SyncPanel({ onClose }: SyncPanelProps) {
           )}
         </div>
 
+        {/* Multi-device: remote vault banner */}
+        {sessionInfo?.found_remote && sessionInfo.remote_is_newer && (
+          <div className="px-4 py-3 bg-darcula-accent/10 border-b border-darcula-accent/30 flex-shrink-0">
+            <p className="text-xs font-mono text-darcula-accent-bright mb-1.5">
+              📱 Existing vault found from another device
+            </p>
+            <p className="text-2xs font-mono text-darcula-text-muted mb-2.5">
+              Another device has already uploaded a prompt database to this Google
+              account. Pull it down to sync your prompts across devices.
+              {sessionInfo.remote_modified && (
+                <> Last modified: {new Date(sessionInfo.remote_modified).toLocaleString()}.</>
+              )}
+            </p>
+            <div className="flex gap-2">
+              <button
+                className="text-2xs font-mono px-3 py-1.5 rounded-sm bg-darcula-accent text-white hover:bg-darcula-accent-bright transition-colors disabled:opacity-40"
+                onClick={handlePullRemote}
+                disabled={pullingRemote}
+              >
+                {pullingRemote ? "Pulling…" : "Pull & merge (recommended)"}
+              </button>
+              <button
+                className="text-2xs font-mono px-3 py-1.5 rounded-sm bg-darcula-bg text-darcula-text-muted hover:text-darcula-text border border-darcula-border transition-colors"
+                onClick={() => setSessionInfo(null)}
+                disabled={pullingRemote}
+              >
+                Keep local
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Error banner */}
         {errorMsg && (
           <div className="px-4 py-2 bg-darcula-error/10 border-b border-darcula-error/30 flex-shrink-0">
@@ -325,7 +405,7 @@ export default function SyncPanel({ onClose }: SyncPanelProps) {
               <p className="text-2xs font-mono text-darcula-text-muted">
                 {config?.team_mode
                   ? "Team mode is active. Your vault syncs to a shared Drive file that teammates can access."
-                  : "Your prompt database is synced to Google Drive's hidden app data folder."}
+                  : "Your prompt database syncs to Google Drive. Sign into the same Google account on any device to access it."}
               </p>
 
               <button
@@ -404,9 +484,6 @@ export default function SyncPanel({ onClose }: SyncPanelProps) {
                       Copy
                     </button>
                   </div>
-                  <p className="text-2xs font-mono text-darcula-text-muted">
-                    You can also share the file via Google Drive's sharing settings for finer access control.
-                  </p>
                 </div>
               )}
 
@@ -492,10 +569,10 @@ export default function SyncPanel({ onClose }: SyncPanelProps) {
                   onClick={handleSignIn}
                   disabled={!canSignIn}
                 >
-                  Sign in with Google (Personal)
+                  Sign in with Google
                 </button>
                 <p className="text-2xs font-mono text-darcula-text-muted text-center">
-                  Syncs to your private Drive app folder — not visible to others.
+                  Sign into the same Google account on any device to access your prompts everywhere.
                 </p>
               </div>
 
@@ -507,9 +584,6 @@ export default function SyncPanel({ onClose }: SyncPanelProps) {
                 >
                   <span className="text-xs font-mono text-darcula-text-bright flex items-center gap-2">
                     👥 Team / Shared Vault
-                    <span className="text-2xs font-mono px-1.5 py-0.5 bg-darcula-accent/20 text-darcula-accent-bright rounded-sm">
-                      New
-                    </span>
                   </span>
                   <span className="text-darcula-text-muted text-xs">{teamSection ? "▲" : "▼"}</span>
                 </button>
@@ -517,8 +591,8 @@ export default function SyncPanel({ onClose }: SyncPanelProps) {
                 {teamSection && (
                   <div className="px-3 py-3 space-y-3 border-t border-darcula-border">
                     <p className="text-2xs font-mono text-darcula-text-muted">
-                      Team mode creates a Drive file that can be shared with others.
-                      It requires re-authorising with expanded permissions (drive.file scope).
+                      Team mode creates a Drive file shareable with others.
+                      Requires re-authorising with expanded permissions.
                     </p>
 
                     {/* Create new team vault */}
@@ -533,22 +607,16 @@ export default function SyncPanel({ onClose }: SyncPanelProps) {
                       >
                         Sign in with Google (Team Mode)
                       </button>
-                      <p className="text-2xs font-mono text-darcula-text-muted">
-                        Creates a shared file in your Drive root. A File ID will be generated that you can share with teammates.
-                      </p>
                     </div>
 
                     <div className="flex items-center gap-2 text-2xs font-mono text-darcula-text-muted">
                       <div className="flex-1 h-px bg-darcula-border" />
-                      <span>or</span>
+                      <span>or join existing</span>
                       <div className="flex-1 h-px bg-darcula-border" />
                     </div>
 
                     {/* Join existing team vault */}
                     <div className="space-y-1.5">
-                      <label className="text-2xs font-mono text-darcula-text-muted uppercase tracking-wider block">
-                        Join Existing Vault
-                      </label>
                       <div className="flex gap-2">
                         <input
                           type="text"
