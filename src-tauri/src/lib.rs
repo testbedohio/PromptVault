@@ -969,7 +969,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .setup(move |_app| {
-            tokio::spawn(run_sync_worker(sync_arc_worker, db_path_worker, worker_rx));
+            tauri::async_runtime::spawn(run_sync_worker(sync_arc_worker, db_path_worker, worker_rx));
             Ok(())
         })
         .manage(AppState {
