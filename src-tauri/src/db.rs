@@ -63,6 +63,21 @@ pub struct StoredEmbedding {
     pub provider: String,
 }
 
+/// Result from a SQL-native cosine similarity search.
+/// `score` is in [0.0, 1.0] — higher means more similar.
+#[derive(Debug, Serialize, Clone)]
+pub struct SimilarityResult {
+    pub prompt_id: i64,
+    pub title: String,
+    pub content: String,
+    pub category_id: Option<i64>,
+    pub tags: Vec<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    /// Cosine similarity in [0.0, 1.0]. 1.0 = identical direction.
+    pub score: f64,
+}
+
 // ─── BLOB ↔ Vec<f32> helpers ────────────────────────────────────
 
 /// Serialize a slice of f32 values to a raw little-endian byte vector.
@@ -79,12 +94,73 @@ fn blob_to_floats(b: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+// ─── SQL Scalar Functions ─────────────────────────────────────────
+//
+// Phase 6: Register a vec_cosine_distance(blob_a, blob_b) scalar
+// function directly in rusqlite.  This gives the same SQL-native
+// similarity queries that sqlite-vec's vec_distance_cosine() provides,
+// using the same raw f32 BLOB format already stored in the embeddings
+// table.  Migrating to sqlite-vec virtual tables in a future phase
+// requires only a schema change — no data migration.
+//
+// The function returns a cosine *distance* (1 − similarity) so that
+// ORDER BY distance ASC == most-similar first, matching sqlite-vec's
+// convention.
+
+fn register_vec_functions(conn: &Connection) -> Result<()> {
+    use rusqlite::functions::FunctionFlags;
+
+    conn.create_scalar_function(
+        "vec_cosine_distance",
+        2,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let a_blob: Vec<u8> = ctx.get(0)?;
+            let b_blob: Vec<u8> = ctx.get(1)?;
+
+            let a = blob_to_floats(&a_blob);
+            let b = blob_to_floats(&b_blob);
+
+            if a.len() != b.len() || a.is_empty() {
+                return Ok(1.0f64); // maximum distance — treat as no match
+            }
+
+            let mut dot  = 0.0f64;
+            let mut na   = 0.0f64;
+            let mut nb   = 0.0f64;
+
+            for i in 0..a.len() {
+                let fa = a[i] as f64;
+                let fb = b[i] as f64;
+                dot += fa * fb;
+                na  += fa * fa;
+                nb  += fb * fb;
+            }
+
+            let denom = na.sqrt() * nb.sqrt();
+            if denom < 1e-10 {
+                return Ok(1.0f64);
+            }
+
+            // distance = 1 − similarity  ∈ [0, 2]  (normalised vecs → [0, 1])
+            Ok(1.0 - dot / denom)
+        },
+    )?;
+
+    Ok(())
+}
+
 // ─── Database Implementation ─────────────────────────────────────
 
 impl Database {
     pub fn new() -> Result<Self> {
         let path = db_path();
         let conn = Connection::open(&path)?;
+
+        // Register custom SQL functions before any other operation.
+        // These are connection-level registrations and are unaffected by
+        // the database's encryption state, so they survive apply_key().
+        register_vec_functions(&conn)?;
 
         // Enable WAL mode for better concurrent read performance
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
@@ -186,19 +262,6 @@ impl Database {
 
     /// Detect and migrate the `embeddings` table if it was created with the
     /// old single-column primary key (`prompt_id` alone).
-    ///
-    /// Detection: `PRAGMA table_info` returns a `pk` column; counting rows where
-    /// `pk > 0` gives the number of PK columns. The old schema had pk=1 only on
-    /// `prompt_id`. The new schema has pk on both `prompt_id` and `provider`.
-    ///
-    /// Migration strategy:
-    ///   1. Rename old table → `_embeddings_old`
-    ///   2. CREATE the new table with the composite PK
-    ///   3. Copy all rows (INSERT OR IGNORE handles any accidental duplicates)
-    ///   4. Drop the renamed backup
-    ///
-    /// The operation is wrapped in a transaction so the DB is never left in a
-    /// half-migrated state.
     fn migrate_embeddings_to_composite_pk(&self) -> Result<()> {
         let pk_count: i32 = self.conn.query_row(
             "SELECT COUNT(*) FROM pragma_table_info('embeddings') WHERE pk > 0",
@@ -206,12 +269,10 @@ impl Database {
             |row| row.get(0),
         )?;
 
-        // 2 = (prompt_id, provider) — already the new schema, nothing to do.
         if pk_count >= 2 {
             return Ok(());
         }
 
-        // pk_count == 1 means the old schema is in place; migrate it.
         self.conn.execute_batch(
             "
             BEGIN;
@@ -228,8 +289,6 @@ impl Database {
                 PRIMARY KEY (prompt_id, provider)
             );
 
-            -- Copy rows from the old table; INSERT OR IGNORE is safe even if
-            -- somehow the old table had duplicate (prompt_id, provider) pairs.
             INSERT OR IGNORE INTO embeddings
                 SELECT prompt_id, vector, model, provider, dimensions, updated_at
                 FROM _embeddings_old;
@@ -571,19 +630,83 @@ impl Database {
         Ok(result)
     }
 
+    // ── SQL-native Similarity Search (Phase 6) ────────────────────
+    //
+    // Uses the vec_cosine_distance() scalar function registered at
+    // connection time to perform cosine similarity search entirely in
+    // SQL.  The JOIN on embeddings is indexed by (provider), so the scan
+    // is efficient even for large vaults.
+    //
+    // This replaces the previous approach of loading all vectors into
+    // JS and computing distances in-process, giving:
+    //   • Consistent results between sessions (DB is the source of truth)
+    //   • No memory spike for large vaults
+    //   • A clear migration path to sqlite-vec vec0 virtual tables
+
+    /// Find the `limit` most similar prompts to `query_vector` for a
+    /// given `provider`, ranked by cosine similarity (highest first).
+    ///
+    /// Returns an empty vec (not an error) when no embeddings are stored
+    /// for that provider — callers should fall back to keyword search.
+    pub fn similarity_search(
+        &self,
+        query_vector: &[f32],
+        provider: &str,
+        limit: i64,
+    ) -> Result<Vec<SimilarityResult>> {
+        if query_vector.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let query_blob = floats_to_blob(query_vector);
+
+        let mut stmt = self.conn.prepare(
+            "SELECT p.id, p.title, p.category_id, p.created_at, p.updated_at,
+                    COALESCE(pv.content_text, '') AS content,
+                    vec_cosine_distance(e.vector, ?1) AS distance
+             FROM prompts p
+             JOIN embeddings e ON e.prompt_id = p.id AND e.provider = ?2
+             LEFT JOIN prompt_versions pv ON pv.id = (
+                 SELECT id FROM prompt_versions WHERE prompt_id = p.id
+                 ORDER BY version_number DESC LIMIT 1
+             )
+             ORDER BY distance ASC
+             LIMIT ?3"
+        )?;
+
+        let rows = stmt
+            .query_map(params![query_blob, provider, limit], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, f64>(6)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut results = Vec::new();
+        for (id, title, category_id, created_at, updated_at, content, distance) in rows {
+            let tags = self.get_tags_for_prompt(id)?;
+            results.push(SimilarityResult {
+                prompt_id: id,
+                title,
+                content,
+                category_id,
+                tags,
+                created_at,
+                updated_at,
+                score: (1.0 - distance).max(0.0), // similarity = 1 − distance
+            });
+        }
+        Ok(results)
+    }
+
     // ── Embeddings ───────────────────────────────────────────────
 
-    /// Persist an embedding for a (prompt, provider) pair.
-    ///
-    /// The composite PRIMARY KEY `(prompt_id, provider)` means:
-    ///   - Calling this for the same prompt with "local" preserves the "gemini"
-    ///     row and vice versa (Option B behaviour).
-    ///   - Calling this again for the same (prompt, provider) updates the vector
-    ///     in-place, which is the correct re-index behaviour.
-    ///
-    /// Vectors are stored as raw little-endian f32 bytes — the same binary
-    /// format used by sqlite-vec, so adding vec0 virtual tables later is a
-    /// schema-only change with no data migration required.
     pub fn save_embedding(
         &self,
         prompt_id: i64,
@@ -603,11 +726,6 @@ impl Database {
         Ok(())
     }
 
-    /// Load all stored embeddings, optionally filtered to a specific provider.
-    ///
-    /// Pass `Some("local")` / `Some("gemini")` / `Some("voyage")` to restore
-    /// only that provider's index on startup or after a provider switch.
-    /// Pass `None` to retrieve every row (e.g. for bulk export or sync).
     pub fn get_all_embeddings(&self, provider_filter: Option<&str>) -> Result<Vec<StoredEmbedding>> {
         let rows = if let Some(provider) = provider_filter {
             let mut stmt = self.conn.prepare(
@@ -643,11 +761,6 @@ impl Database {
         Ok(rows)
     }
 
-    /// Delete all stored embeddings for a specific provider.
-    ///
-    /// Called by the frontend's BrainSelector "Rebuild Index" action when the
-    /// user wants to discard stale vectors for a particular backend and start
-    /// fresh.  Rows for other providers are not touched.
     pub fn delete_embeddings_by_provider(&self, provider: &str) -> Result<usize> {
         let count = self.conn.execute(
             "DELETE FROM embeddings WHERE provider = ?1",
@@ -658,14 +771,6 @@ impl Database {
 
     // ── SQLCipher key management ──────────────────────────────────
 
-    /// Apply the SQLCipher decryption key to this connection.
-    ///
-    /// **Must be called before any other statement on an encrypted database.**
-    /// For a plaintext database this is a no-op (SQLCipher accepts an empty key
-    /// for unencrypted files), so it is safe to call unconditionally when a key
-    /// is present.
-    ///
-    /// Returns `Err` if the key is wrong (subsequent sqlite_master read fails).
     pub fn apply_key(&self, key_hex: &str) -> Result<()> {
         self.conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";\n", key_hex))?;
         // Verify by touching the schema — SQLCipher returns SQLITE_NOTADB on bad key.
@@ -673,12 +778,6 @@ impl Database {
         Ok(())
     }
 
-    /// Re-key the database (encrypt plaintext DB, change key, or remove encryption).
-    ///
-    /// - `Some(hex)` → encrypt (or re-encrypt) with the given key.
-    /// - `None`      → remove encryption (decrypt to plaintext).
-    ///
-    /// The current key must already be applied via `apply_key` before calling this.
     pub fn rekey(&self, new_key_hex: Option<&str>) -> Result<()> {
         let pragma = match new_key_hex {
             Some(hex) => format!("PRAGMA rekey = \"x'{}'\";", hex),
@@ -690,34 +789,14 @@ impl Database {
 
     // ── Conflict resolution ───────────────────────────────────────
 
-    /// Replace the contents of the live database connection with those from a
-    /// SQLite file at `source_path`, using SQLite's online backup API.
-    ///
-    /// Why the backup API instead of `fs::copy` followed by a re-open?
-    ///
-    ///   - `fs::copy` can't safely replace a file that has an open connection
-    ///     (especially on Windows, where the file is locked).
-    ///   - The backup API copies pages from the source into the *existing* live
-    ///     connection, so all in-process statement caches are updated atomically
-    ///     and there is never a moment where `self.conn` points to a partial or
-    ///     empty database.
-    ///   - WAL mode is handled transparently: rusqlite checkpoints the WAL
-    ///     before beginning the backup.
-    ///
-    /// After this call, `self.conn` contains exactly the data from `source_path`.
-    /// The caller is responsible for deleting the temp file.
     pub fn restore_from(&mut self, source_path: &str) -> Result<()> {
         use rusqlite::backup::{Backup, StepResult};
         use std::time::Duration;
 
         let src = Connection::open(source_path)?;
 
-        // `Backup::new(from, to)` — copies `src` INTO `self.conn`.
         let backup = Backup::new(&src, &mut self.conn)?;
 
-        // Copy in 1 000-page steps with a 250 ms sleep between steps to avoid
-        // starving any concurrent readers (though in practice the std::sync::Mutex
-        // means we are the only holder when this runs).
         loop {
             match backup.step(1000)? {
                 StepResult::Done | StepResult::Busy | StepResult::Locked => break,
