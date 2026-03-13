@@ -90,107 +90,74 @@ export async function saveEmbedding(
   return call<boolean>("save_embedding", { promptId, vector, model, provider });
 }
 
-/**
- * Load all stored embeddings for a specific provider.
- *
- * Pass the provider name ("local", "gemini", or "voyage") to retrieve only
- * that provider's vectors.  Pass an empty string to retrieve every row.
- */
 export async function getAllEmbeddings(provider: string = ""): Promise<StoredEmbedding[]> {
   return call<StoredEmbedding[]>("get_all_embeddings", { provider });
 }
 
-/**
- * Delete all stored embeddings for a specific provider.
- * Returns the number of rows deleted.
- */
 export async function deleteEmbeddingsByProvider(provider: string): Promise<number> {
   return call<number>("delete_embeddings_by_provider", { provider });
 }
 
-// ─── Phase 6: SQL Vector Search ──────────────────────────────────
+// ─── Vector Search (Phase 6) ─────────────────────────────────────
 
 export interface VectorSearchResult {
   /** ID of the matching prompt. */
   prompt_id: number;
-  /** Cosine similarity in [0, 1]; higher = more similar. */
+  /** Cosine similarity in [0, 1] — higher is more similar. */
   similarity: number;
 }
 
 /**
- * Perform a SQL-level cosine similarity search using sqlite-vec.
+ * Rust-side cosine similarity search over stored embeddings.
  *
- * Requires the sqlite-vec extension to be loaded (done automatically at
- * startup). If the extension failed to load, this will throw — the caller
- * should catch and fall back to JS-side cosine similarity.
+ * Scoring runs entirely in Rust (no JS round-trip for each vector),
+ * scoped to `provider` so dimension-mismatched vectors are never compared.
  *
- * @param queryVector  Float32 embedding of the query text.
- * @param provider     Provider name matching stored embeddings ("local", "gemini", "claude").
- * @param topK         Maximum number of results to return (default 10).
+ * Returns up to `topK` results sorted by similarity descending.
+ * Returns an empty array (not an error) when no embeddings are stored.
  */
 export async function vectorSearch(
-  queryVector: number[],
+  vector: number[],
   provider: string,
   topK: number = 10
 ): Promise<VectorSearchResult[]> {
-  return call<VectorSearchResult[]>("vector_search", { queryVector, provider, topK });
+  return call<VectorSearchResult[]>("vector_search", { vector, provider, topK });
 }
 
 // ─── Export ──────────────────────────────────────────────────────
 
 /**
- * Export all prompts to a string in the requested format.
+ * Export a single prompt as a Markdown string with YAML front-matter.
  *
- * @param format  `"json"` for a structured JSON document, or `"markdown"` for
- *                a human-readable Markdown file with one section per prompt.
- * @returns       The full export as a string — pass to a Blob to trigger a download.
+ * The returned string is ready to write to a `.md` file. The caller is
+ * responsible for triggering the browser download (e.g. via a Blob URL).
  */
-export async function getExportData(format: "json" | "markdown"): Promise<string> {
-  return call<string>("get_export_data", { format });
-}
-
-// ─── Keyboard Shortcuts ───────────────────────────────────────────
-
-export interface ShortcutsConfig {
-  /** Open Command Palette  (default: ctrl+k) */
-  command_palette: string;
-  /** Create new prompt      (default: ctrl+n) */
-  new_prompt: string;
-  /** Open Brain Selector    (default: ctrl+b) */
-  brain_selector: string;
-  /** Toggle Inspector panel (default: ctrl+i) */
-  toggle_inspector: string;
-  /** Open Sync Panel        (default: ctrl+shift+s) */
-  sync_panel: string;
-  /** Open Export Dialog     (default: ctrl+shift+e) */
-  export: string;
-  /** Open Shortcuts dialog  (default: ctrl+,) */
-  shortcuts: string;
-}
-
-export const DEFAULT_SHORTCUTS: ShortcutsConfig = {
-  command_palette: "ctrl+k",
-  new_prompt: "ctrl+n",
-  brain_selector: "ctrl+b",
-  toggle_inspector: "ctrl+i",
-  sync_panel: "ctrl+shift+s",
-  export: "ctrl+shift+e",
-  shortcuts: "ctrl+,",
-};
-
-/**
- * Load the persisted keyboard shortcuts configuration.
- * Returns defaults if no configuration has been saved.
- */
-export async function getShortcuts(): Promise<ShortcutsConfig> {
-  return call<ShortcutsConfig>("get_shortcuts");
+export async function exportPromptMarkdown(id: number): Promise<string> {
+  return call<string>("export_prompt_markdown", { id });
 }
 
 /**
- * Persist the keyboard shortcuts configuration to disk.
+ * Export prompts as a JSON array string.
+ *
+ * Pass an empty array to export every prompt, or a list of IDs to export
+ * a specific subset. The caller triggers the download.
  */
-export async function saveShortcuts(config: ShortcutsConfig): Promise<boolean> {
-  return call<boolean>("save_shortcuts", { config });
+export async function exportPromptsJson(ids: number[] = []): Promise<string> {
+  return call<string>("export_prompts_json", { ids });
+}
+
+/**
+ * Trigger a browser file download with the given content and filename.
+ * Works in both Tauri (via Blob) and browser-mode.
+ */
+export function downloadFile(content: string, filename: string, mimeType: string = "text/plain"): void {
+  const blob = new Blob([content], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 // ─── Sync ────────────────────────────────────────────────────────
@@ -205,14 +172,8 @@ export interface SyncConfig {
   remote_file_id: string | null;
   last_sync: string | null;
   sync_status: string | { Error: string };
-  /** Whether the periodic background sync worker should run. */
   auto_sync_enabled: boolean;
-  /** How often the worker uploads, in minutes (5 / 15 / 30 / 60). */
   auto_sync_interval_mins: number;
-  /** Whether team/shared-vault mode is active. */
-  team_mode: boolean;
-  /** Drive File ID of the shared team vault. */
-  team_file_id: string | null;
 }
 
 export function isSyncConnected(config: SyncConfig): boolean {
@@ -232,48 +193,11 @@ export function getSyncStatusLabel(config: SyncConfig): string {
   return String(config.sync_status);
 }
 
-/**
- * Start the Google Drive OAuth 2.0 flow (personal mode — appDataFolder scope).
- *
- * Saves credentials, spawns a one-shot localhost:8741 callback listener,
- * and returns the Google authorization URL to open in the system browser.
- *
- * After calling this, poll `getSyncConfig()` until sync_status is "Connected".
- */
 export async function startOAuthFlow(
   clientId: string,
   clientSecret: string
 ): Promise<string> {
   return call<string>("start_oauth_flow", { clientId, clientSecret });
-}
-
-/**
- * Start the Google Drive OAuth 2.0 flow in team mode (drive.file scope).
- *
- * Team mode creates files in the user's regular Drive root (not the hidden
- * appDataFolder), making them shareable with teammates via Google Drive's
- * sharing UI.
- *
- * After the user completes sign-in, call `syncToDrive()` to upload the vault
- * and receive the team file ID — then share that ID with teammates.
- */
-export async function startTeamOAuthFlow(
-  clientId: string,
-  clientSecret: string
-): Promise<string> {
-  return call<string>("start_team_oauth_flow", { clientId, clientSecret });
-}
-
-/**
- * Connect this device to an existing shared team vault.
- *
- * The user must already be authenticated before calling this.  After calling,
- * `syncToDrive()` will read/write the specified team file.
- *
- * @param fileId  Drive File ID shared by the vault creator.
- */
-export async function connectTeamVault(fileId: string): Promise<boolean> {
-  return call<boolean>("connect_team_vault", { fileId });
 }
 
 export async function getSyncConfig(): Promise<SyncConfig> {
@@ -300,12 +224,6 @@ export async function checkSyncStatus(): Promise<string | null> {
   return call<string | null>("check_sync_status");
 }
 
-/**
- * Enable or disable the periodic background sync worker.
- *
- * @param enabled       Whether to run the worker.
- * @param intervalMins  Upload interval in minutes (5 / 15 / 30 / 60).
- */
 export async function setAutoSync(
   enabled: boolean,
   intervalMins: number
@@ -315,45 +233,20 @@ export async function setAutoSync(
 
 // ─── Conflict Resolution ─────────────────────────────────────────
 
-/** Returned by `getConflictInfo` when the remote DB is newer than local. */
 export interface ConflictInfo {
-  /** ISO 8601 timestamp of the remote file's last modification. */
   remote_modified: string;
-  /** ISO 8601 timestamp of our last sync, or null if we've never synced. */
   local_last_sync: string | null;
-  /** Always true when this object is returned (remote has unseen changes). */
   remote_is_newer: boolean;
 }
 
-/** Returned by `resolveConflict`. `data_replaced: true` means the local DB
- *  was overwritten with the remote and the frontend must reload all data. */
 export interface ResolveResult {
   data_replaced: boolean;
 }
 
-/**
- * Check whether the remote database is newer than the local one.
- *
- * Returns `ConflictInfo` when a conflict exists, `null` when local is
- * up-to-date (or the user is not connected to Drive).
- *
- * Call this on app startup after confirming the user is connected.
- */
 export async function getConflictInfo(): Promise<ConflictInfo | null> {
   return call<ConflictInfo | null>("get_conflict_info");
 }
 
-/**
- * Resolve a sync conflict.
- *
- * @param strategy
- *   - `"accept_newest"` — last-write-wins: pulls remote if it's newer,
- *     pushes local if local is newer.
- *   - `"keep_local"` — unconditionally push local, overwriting the remote.
- *
- * When `result.data_replaced` is `true`, the frontend must reload all data
- * (prompts, categories, tags) because the in-memory state is stale.
- */
 export async function resolveConflict(
   strategy: "accept_newest" | "keep_local"
 ): Promise<ResolveResult> {
@@ -363,46 +256,59 @@ export async function resolveConflict(
 // ─── Encryption ──────────────────────────────────────────────────
 
 export interface DbLockStatus {
-  /** True when the DB is encrypted (salt file exists). */
   encrypted: boolean;
-  /** True when the key has been applied this session — always true if not encrypted. */
   unlocked: boolean;
 }
 
-/**
- * Check whether the database is encrypted and, if so, whether it is currently
- * unlocked. Call this once on startup to determine whether to show the
- * UnlockDialog.
- */
 export async function getDbLockStatus(): Promise<DbLockStatus> {
   return call<DbLockStatus>("get_db_lock_status");
 }
 
-/**
- * Unlock an encrypted database using the master password.
- *
- * Derives the key from the stored salt + password (Argon2id) and applies it
- * to the live SQLite connection. Returns `true` on success, throws on wrong
- * password.
- */
 export async function unlockDatabase(password: string): Promise<boolean> {
   return call<boolean>("unlock_database", { password });
 }
 
-/**
- * Set, change, or remove the master password.
- *
- * | `current`      | `newPassword`  | Effect                                    |
- * |----------------|----------------|-------------------------------------------|
- * | `null`         | `"pw"`         | Enable encryption on a plaintext DB       |
- * | `"old"`        | `"new"`        | Change the password                       |
- * | `"old"`        | `null`         | Remove encryption                         |
- *
- * Throws if `current` is wrong or missing when the DB is already encrypted.
- */
 export async function setDbPassword(
   current: string | null,
   newPassword: string | null
 ): Promise<boolean> {
   return call<boolean>("set_db_password", { current, newPassword });
+}
+
+// ─── Keyboard Shortcuts ───────────────────────────────────────────
+
+/**
+ * The set of configurable keyboard shortcut action keys.
+ *
+ * Values are human-readable accelerator strings like "Ctrl+K".
+ * Defaults mirror the original hardcoded values so no user action is needed.
+ */
+export interface ShortcutMap {
+  commandPalette: string;
+  newPrompt: string;
+  brainSelector: string;
+  syncPanel: string;
+  shortcuts: string;
+}
+
+/** Fetch the current shortcut map from disk (merges saved + defaults). */
+export async function getShortcuts(): Promise<ShortcutMap> {
+  return call<ShortcutMap>("get_shortcuts");
+}
+
+/**
+ * Update a single shortcut.
+ *
+ * Pass an empty string for `accelerator` to reset the action to its default.
+ */
+export async function setShortcut(
+  action: keyof ShortcutMap,
+  accelerator: string
+): Promise<boolean> {
+  return call<boolean>("set_shortcut", { action, accelerator });
+}
+
+/** Reset all shortcuts to their defaults and return the new map. */
+export async function resetShortcuts(): Promise<ShortcutMap> {
+  return call<ShortcutMap>("reset_shortcuts");
 }
