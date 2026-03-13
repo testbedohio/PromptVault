@@ -15,7 +15,16 @@ pub struct SyncConfig {
     pub remote_file_id: Option<String>,
     pub last_sync: Option<String>,
     pub sync_status: SyncStatus,
+    /// Whether the periodic background sync worker should run.
+    /// Separate from `enabled` (which means OAuth is configured).
+    #[serde(default)]
+    pub auto_sync_enabled: bool,
+    /// How often the background worker uploads, in minutes. Default: 5.
+    #[serde(default = "default_interval")]
+    pub auto_sync_interval_mins: u32,
 }
+
+fn default_interval() -> u32 { 5 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum SyncStatus {
@@ -39,6 +48,8 @@ impl Default for SyncConfig {
             remote_file_id: None,
             last_sync: None,
             sync_status: SyncStatus::Disconnected,
+            auto_sync_enabled: false,
+            auto_sync_interval_mins: 5,
         }
     }
 }
@@ -355,7 +366,7 @@ impl DriveSync {
     }
 
     /// Ensure we have a valid access token, refreshing if it's expired or close to expiry.
-    async fn ensure_fresh_token(&mut self) -> Result<(), String> {
+    pub async fn ensure_fresh_token(&mut self) -> Result<(), String> {
         let expiry = self.config.token_expiry.unwrap_or(0);
         // Refresh if token expires within 60 seconds
         if Utc::now().timestamp() + 60 >= expiry {
