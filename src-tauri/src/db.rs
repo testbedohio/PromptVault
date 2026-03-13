@@ -655,4 +655,46 @@ impl Database {
         )?;
         Ok(count)
     }
+
+    // ── Conflict resolution ───────────────────────────────────────
+
+    /// Replace the contents of the live database connection with those from a
+    /// SQLite file at `source_path`, using SQLite's online backup API.
+    ///
+    /// Why the backup API instead of `fs::copy` followed by a re-open?
+    ///
+    ///   - `fs::copy` can't safely replace a file that has an open connection
+    ///     (especially on Windows, where the file is locked).
+    ///   - The backup API copies pages from the source into the *existing* live
+    ///     connection, so all in-process statement caches are updated atomically
+    ///     and there is never a moment where `self.conn` points to a partial or
+    ///     empty database.
+    ///   - WAL mode is handled transparently: rusqlite checkpoints the WAL
+    ///     before beginning the backup.
+    ///
+    /// After this call, `self.conn` contains exactly the data from `source_path`.
+    /// The caller is responsible for deleting the temp file.
+    pub fn restore_from(&mut self, source_path: &str) -> Result<()> {
+        use rusqlite::backup::{Backup, StepResult};
+        use std::time::Duration;
+
+        let src = Connection::open(source_path)?;
+
+        // `Backup::new(from, to)` — copies `src` INTO `self.conn`.
+        let backup = Backup::new(&src, &mut self.conn)?;
+
+        // Copy in 1 000-page steps with a 250 ms sleep between steps to avoid
+        // starving any concurrent readers (though in practice the std::sync::Mutex
+        // means we are the only holder when this runs).
+        loop {
+            match backup.step(1000)? {
+                StepResult::Done | StepResult::Busy | StepResult::Locked => break,
+                StepResult::More => {
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
