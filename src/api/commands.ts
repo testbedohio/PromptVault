@@ -174,6 +174,10 @@ export interface SyncConfig {
   sync_status: string | { Error: string };
   auto_sync_enabled: boolean;
   auto_sync_interval_mins: number;
+  /** True when syncing to a shared Drive file (team mode). */
+  team_mode: boolean;
+  /** The Drive file ID of the shared team vault, when team_mode is true. */
+  team_file_id: string | null;
 }
 
 export function isSyncConnected(config: SyncConfig): boolean {
@@ -311,4 +315,55 @@ export async function setShortcut(
 /** Reset all shortcuts to their defaults and return the new map. */
 export async function resetShortcuts(): Promise<ShortcutMap> {
   return call<ShortcutMap>("reset_shortcuts");
+}
+
+// ─── Multi-device / Team Sync ─────────────────────────────────────
+
+/** Returned by `initSyncSession`. */
+export interface SyncSessionInfo {
+  /** True when an existing remote file was found (and claimed). */
+  found_remote: boolean;
+  /** The remote file's RFC 3339 modifiedTime, when found. */
+  remote_modified: string | null;
+  /** True when the remote is newer than local last_sync. */
+  remote_is_newer: boolean;
+}
+
+/**
+ * Discover and claim an existing remote DB on this device.
+ *
+ * Call this once after OAuth completes (or on startup when already connected).
+ * Searches appDataFolder for an existing `prompt_vault.db` and stores its ID
+ * locally — preventing a second device from creating a duplicate file.
+ *
+ * When `result.found_remote && result.remote_is_newer`, offer the user the
+ * option to pull the remote DB down (same as the conflict resolution flow).
+ */
+export async function initSyncSession(): Promise<SyncSessionInfo> {
+  return call<SyncSessionInfo>('init_sync_session');
+}
+
+/**
+ * Start the Google Drive OAuth flow with the `drive.file` scope (team mode).
+ *
+ * Creates a new team vault file in Drive root after OAuth completes.
+ * Poll `getSyncConfig()` until `sync_status` is "Synced" to get the
+ * generated `team_file_id` to share with teammates.
+ */
+export async function startTeamOAuthFlow(
+  clientId: string,
+  clientSecret: string
+): Promise<string> {
+  return call<string>('start_team_oauth_flow', { clientId, clientSecret });
+}
+
+/**
+ * Connect to an existing team vault by its Drive file ID.
+ *
+ * Teammates paste the file ID shared by the vault creator.
+ * Requires the user to already be authenticated (personal OAuth is fine if
+ * the file has been shared with them via Google Drive sharing).
+ */
+export async function connectTeamVault(fileId: string): Promise<boolean> {
+  return call<boolean>('connect_team_vault', { fileId });
 }
