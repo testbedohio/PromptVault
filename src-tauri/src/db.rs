@@ -100,7 +100,7 @@ impl Database {
         self.path.to_string_lossy().to_string()
     }
 
-    /// Create all tables and FTS5 virtual table
+    /// Create all tables and FTS5 virtual table, then run any pending migrations.
     fn initialize_schema(&self) -> Result<()> {
         self.conn.execute_batch(
             "
@@ -152,27 +152,96 @@ impl Database {
                 tokenize='porter unicode61'
             );
 
-            -- Persistent embedding store (one row per prompt, upserted on re-embed).
-            -- Stores the latest embedding for the active provider/model.
+            -- Persistent embedding store (Option B: one row per prompt+provider pair).
+            -- PRIMARY KEY (prompt_id, provider) allows each embedding backend to
+            -- maintain independent vectors without overwriting the others.
             -- The BLOB format (raw little-endian f32 bytes) is wire-compatible
             -- with sqlite-vec's vec type, enabling future SQL similarity queries
             -- without a data migration.
             CREATE TABLE IF NOT EXISTS embeddings (
-                prompt_id  INTEGER PRIMARY KEY REFERENCES prompts(id) ON DELETE CASCADE,
+                prompt_id  INTEGER NOT NULL REFERENCES prompts(id) ON DELETE CASCADE,
                 vector     BLOB    NOT NULL,
                 model      TEXT    NOT NULL,
                 provider   TEXT    NOT NULL,
                 dimensions INTEGER NOT NULL,
-                updated_at TEXT    NOT NULL DEFAULT (datetime('now'))
+                updated_at TEXT    NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (prompt_id, provider)
             );
 
             -- Indexes
             CREATE INDEX IF NOT EXISTS idx_prompts_category ON prompts(category_id);
             CREATE INDEX IF NOT EXISTS idx_prompt_versions_prompt ON prompt_versions(prompt_id);
             CREATE INDEX IF NOT EXISTS idx_categories_parent ON categories(parent_id);
-            CREATE INDEX IF NOT EXISTS idx_embeddings_model ON embeddings(model);
+            CREATE INDEX IF NOT EXISTS idx_embeddings_provider ON embeddings(provider);
             "
         )?;
+
+        // Migrate the embeddings table from the old single-column PK schema
+        // (prompt_id alone) to the new composite PK (prompt_id, provider).
+        // This is a no-op on fresh installs.
+        self.migrate_embeddings_to_composite_pk()?;
+
+        Ok(())
+    }
+
+    /// Detect and migrate the `embeddings` table if it was created with the
+    /// old single-column primary key (`prompt_id` alone).
+    ///
+    /// Detection: `PRAGMA table_info` returns a `pk` column; counting rows where
+    /// `pk > 0` gives the number of PK columns. The old schema had pk=1 only on
+    /// `prompt_id`. The new schema has pk on both `prompt_id` and `provider`.
+    ///
+    /// Migration strategy:
+    ///   1. Rename old table → `_embeddings_old`
+    ///   2. CREATE the new table with the composite PK
+    ///   3. Copy all rows (INSERT OR IGNORE handles any accidental duplicates)
+    ///   4. Drop the renamed backup
+    ///
+    /// The operation is wrapped in a transaction so the DB is never left in a
+    /// half-migrated state.
+    fn migrate_embeddings_to_composite_pk(&self) -> Result<()> {
+        let pk_count: i32 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('embeddings') WHERE pk > 0",
+            [],
+            |row| row.get(0),
+        )?;
+
+        // 2 = (prompt_id, provider) — already the new schema, nothing to do.
+        if pk_count >= 2 {
+            return Ok(());
+        }
+
+        // pk_count == 1 means the old schema is in place; migrate it.
+        self.conn.execute_batch(
+            "
+            BEGIN;
+
+            ALTER TABLE embeddings RENAME TO _embeddings_old;
+
+            CREATE TABLE embeddings (
+                prompt_id  INTEGER NOT NULL REFERENCES prompts(id) ON DELETE CASCADE,
+                vector     BLOB    NOT NULL,
+                model      TEXT    NOT NULL,
+                provider   TEXT    NOT NULL,
+                dimensions INTEGER NOT NULL,
+                updated_at TEXT    NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (prompt_id, provider)
+            );
+
+            -- Copy rows from the old table; INSERT OR IGNORE is safe even if
+            -- somehow the old table had duplicate (prompt_id, provider) pairs.
+            INSERT OR IGNORE INTO embeddings
+                SELECT prompt_id, vector, model, provider, dimensions, updated_at
+                FROM _embeddings_old;
+
+            DROP TABLE _embeddings_old;
+
+            CREATE INDEX IF NOT EXISTS idx_embeddings_provider ON embeddings(provider);
+
+            COMMIT;
+            "
+        )?;
+
         Ok(())
     }
 
@@ -504,8 +573,14 @@ impl Database {
 
     // ── Embeddings ───────────────────────────────────────────────
 
-    /// Persist an embedding for a prompt. Uses INSERT OR REPLACE so calling
-    /// this after every (re)embed keeps the table current without manual deletes.
+    /// Persist an embedding for a (prompt, provider) pair.
+    ///
+    /// The composite PRIMARY KEY `(prompt_id, provider)` means:
+    ///   - Calling this for the same prompt with "local" preserves the "gemini"
+    ///     row and vice versa (Option B behaviour).
+    ///   - Calling this again for the same (prompt, provider) updates the vector
+    ///     in-place, which is the correct re-index behaviour.
+    ///
     /// Vectors are stored as raw little-endian f32 bytes — the same binary
     /// format used by sqlite-vec, so adding vec0 virtual tables later is a
     /// schema-only change with no data migration required.
@@ -528,17 +603,19 @@ impl Database {
         Ok(())
     }
 
-    /// Load all stored embeddings, optionally filtered to a specific model.
-    /// Pass `None` to retrieve every row (e.g. for bulk export or migration).
-    /// Pass `Some("all-MiniLM-L6-v2")` to restore only the local provider index.
-    pub fn get_all_embeddings(&self, model_filter: Option<&str>) -> Result<Vec<StoredEmbedding>> {
-        let rows = if let Some(model) = model_filter {
+    /// Load all stored embeddings, optionally filtered to a specific provider.
+    ///
+    /// Pass `Some("local")` / `Some("gemini")` / `Some("voyage")` to restore
+    /// only that provider's index on startup or after a provider switch.
+    /// Pass `None` to retrieve every row (e.g. for bulk export or sync).
+    pub fn get_all_embeddings(&self, provider_filter: Option<&str>) -> Result<Vec<StoredEmbedding>> {
+        let rows = if let Some(provider) = provider_filter {
             let mut stmt = self.conn.prepare(
                 "SELECT prompt_id, vector, model, provider
                  FROM embeddings
-                 WHERE model = ?1"
+                 WHERE provider = ?1"
             )?;
-            stmt.query_map(params![model], |row| {
+            stmt.query_map(params![provider], |row| {
                 let blob: Vec<u8> = row.get(1)?;
                 Ok(StoredEmbedding {
                     prompt_id: row.get(0)?,
@@ -564,5 +641,18 @@ impl Database {
             .collect::<Result<Vec<_>>>()?
         };
         Ok(rows)
+    }
+
+    /// Delete all stored embeddings for a specific provider.
+    ///
+    /// Called by the frontend's BrainSelector "Rebuild Index" action when the
+    /// user wants to discard stale vectors for a particular backend and start
+    /// fresh.  Rows for other providers are not touched.
+    pub fn delete_embeddings_by_provider(&self, provider: &str) -> Result<usize> {
+        let count = self.conn.execute(
+            "DELETE FROM embeddings WHERE provider = ?1",
+            params![provider],
+        )?;
+        Ok(count)
     }
 }
