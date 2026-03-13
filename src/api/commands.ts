@@ -90,8 +90,34 @@ export async function saveEmbedding(
   return call<boolean>("save_embedding", { promptId, vector, model, provider });
 }
 
-export async function getAllEmbeddings(model: string = ""): Promise<StoredEmbedding[]> {
-  return call<StoredEmbedding[]>("get_all_embeddings", { model });
+/**
+ * Load all stored embeddings for a specific provider.
+ *
+ * Pass the provider name ("local", "gemini", or "voyage") to retrieve only
+ * that provider's vectors — the right thing to do on startup or after a
+ * provider switch.  Pass an empty string to retrieve every row.
+ *
+ * This replaces the old model-filtered API.  The provider name is the correct
+ * key for Option B because:
+ *   - Each provider always maps to exactly one model (local→all-MiniLM-L6-v2,
+ *     gemini→text-embedding-004, voyage→voyage-3-lite).
+ *   - Filtering by provider is forward-compatible if a provider ever updates
+ *     its default model — the old vectors are simply overwritten on re-index.
+ */
+export async function getAllEmbeddings(provider: string = ""): Promise<StoredEmbedding[]> {
+  return call<StoredEmbedding[]>("get_all_embeddings", { provider });
+}
+
+/**
+ * Delete all stored embeddings for a specific provider.
+ *
+ * Used by BrainSelector's "Rebuild Index" button to clear stale vectors before
+ * a full re-index.  Rows for other providers are not affected.
+ *
+ * Returns the number of rows deleted.
+ */
+export async function deleteEmbeddingsByProvider(provider: string): Promise<number> {
+  return call<number>("delete_embeddings_by_provider", { provider });
 }
 
 // ─── Sync ────────────────────────────────────────────────────────
