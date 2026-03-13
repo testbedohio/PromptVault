@@ -4,6 +4,7 @@ import {
   getSyncConfig,
   syncToDrive,
   updateSyncConfig,
+  setAutoSync,
   isSyncConnected,
   isSyncError,
   getSyncStatusLabel,
@@ -26,14 +27,21 @@ interface SyncPanelProps {
 }
 
 type AuthPhase =
-  | "idle"          // haven't started
-  | "waiting"       // browser open, polling for callback
-  | "connected"     // successfully authenticated
-  | "syncing"       // upload in progress
-  | "error";        // something went wrong
+  | "idle"       // haven't started
+  | "waiting"    // browser open, polling for callback
+  | "connected"  // successfully authenticated
+  | "syncing"    // upload in progress
+  | "error";     // something went wrong
 
 const POLL_INTERVAL_MS = 1500;
 const POLL_TIMEOUT_MS  = 200_000; // slightly longer than the Rust 3-min window
+
+const INTERVAL_OPTIONS: { label: string; value: number }[] = [
+  { label: "Every 5 minutes",  value: 5  },
+  { label: "Every 15 minutes", value: 15 },
+  { label: "Every 30 minutes", value: 30 },
+  { label: "Every hour",       value: 60 },
+];
 
 export default function SyncPanel({ onClose }: SyncPanelProps) {
   const [clientId, setClientId]         = useState("");
@@ -43,6 +51,7 @@ export default function SyncPanel({ onClose }: SyncPanelProps) {
   const [config, setConfig]             = useState<SyncConfig | null>(null);
   const [errorMsg, setErrorMsg]         = useState<string | null>(null);
   const [syncing, setSyncing]           = useState(false);
+  const [savingAutoSync, setSavingAutoSync] = useState(false);
 
   const pollRef    = useRef<ReturnType<typeof setInterval> | null>(null);
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -53,10 +62,7 @@ export default function SyncPanel({ onClose }: SyncPanelProps) {
     getSyncConfig()
       .then((cfg) => {
         setConfig(cfg);
-        if (isSyncConnected(cfg)) {
-          setPhase("connected");
-        }
-        // Pre-fill credential fields if already saved
+        if (isSyncConnected(cfg)) setPhase("connected");
         if (cfg.client_id) setClientId(cfg.client_id);
         if (cfg.client_secret) setClientSecret(cfg.client_secret);
       })
@@ -95,7 +101,6 @@ export default function SyncPanel({ onClose }: SyncPanelProps) {
       }
     }, POLL_INTERVAL_MS);
 
-    // Hard timeout — give up after the Rust listener window plus a buffer
     timeoutRef.current = setTimeout(() => {
       stopPolling();
       if (phase === "waiting") {
@@ -150,14 +155,44 @@ export default function SyncPanel({ onClose }: SyncPanelProps) {
       token_expiry: null,
       remote_file_id: null,
       sync_status: "Disconnected",
+      auto_sync_enabled: false,
     };
     try {
       await updateSyncConfig(reset);
+      // Also stop the background worker
+      await setAutoSync(false, config.auto_sync_interval_mins ?? 5);
       setConfig(reset);
       setPhase("idle");
       setErrorMsg(null);
     } catch (e) {
       setErrorMsg(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const handleAutoSyncToggle = async () => {
+    if (!config) return;
+    const next = !config.auto_sync_enabled;
+    setSavingAutoSync(true);
+    try {
+      await setAutoSync(next, config.auto_sync_interval_mins ?? 5);
+      setConfig({ ...config, auto_sync_enabled: next });
+    } catch (e) {
+      setErrorMsg(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSavingAutoSync(false);
+    }
+  };
+
+  const handleIntervalChange = async (mins: number) => {
+    if (!config) return;
+    setSavingAutoSync(true);
+    try {
+      await setAutoSync(config.auto_sync_enabled, mins);
+      setConfig({ ...config, auto_sync_interval_mins: mins });
+    } catch (e) {
+      setErrorMsg(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSavingAutoSync(false);
     }
   };
 
@@ -240,6 +275,7 @@ export default function SyncPanel({ onClose }: SyncPanelProps) {
                 in your regular Drive files.
               </p>
 
+              {/* Manual sync button */}
               <button
                 className="w-full text-xs font-mono px-3 py-2 rounded-sm bg-darcula-accent text-white hover:bg-darcula-accent-bright transition-colors disabled:opacity-50"
                 onClick={handleSyncNow}
@@ -247,6 +283,65 @@ export default function SyncPanel({ onClose }: SyncPanelProps) {
               >
                 {syncing ? "Syncing…" : "Sync Now"}
               </button>
+
+              {/* ── Auto-sync settings ── */}
+              <div className="border border-darcula-border rounded-sm p-3 space-y-2.5">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-mono text-darcula-text">
+                    Auto-sync
+                  </span>
+
+                  {/* Toggle */}
+                  <button
+                    className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors focus:outline-none disabled:opacity-40 ${
+                      config?.auto_sync_enabled
+                        ? "bg-darcula-accent"
+                        : "bg-darcula-border"
+                    }`}
+                    onClick={handleAutoSyncToggle}
+                    disabled={savingAutoSync}
+                    title={config?.auto_sync_enabled ? "Disable auto-sync" : "Enable auto-sync"}
+                  >
+                    <span
+                      className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
+                        config?.auto_sync_enabled ? "translate-x-4" : "translate-x-0.5"
+                      }`}
+                    />
+                  </button>
+                </div>
+
+                {/* Interval selector — only shown when auto-sync is on */}
+                {config?.auto_sync_enabled && (
+                  <div>
+                    <label className="text-2xs font-mono text-darcula-text-muted uppercase tracking-wider block mb-1">
+                      Sync interval
+                    </label>
+                    <div className="flex gap-1.5 flex-wrap">
+                      {INTERVAL_OPTIONS.map((opt) => (
+                        <button
+                          key={opt.value}
+                          className={`text-2xs font-mono px-2.5 py-1 rounded-sm border transition-colors disabled:opacity-40 ${
+                            config.auto_sync_interval_mins === opt.value
+                              ? "border-darcula-accent bg-darcula-accent/20 text-darcula-accent-bright"
+                              : "border-darcula-border text-darcula-text-muted hover:border-darcula-accent/60 hover:text-darcula-text"
+                          }`}
+                          onClick={() => handleIntervalChange(opt.value)}
+                          disabled={savingAutoSync}
+                        >
+                          {opt.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {config?.auto_sync_enabled && (
+                  <p className="text-2xs font-mono text-darcula-text-muted">
+                    PromptVault will silently upload your database in the background.
+                    Syncs only occur when Google Drive is connected.
+                  </p>
+                )}
+              </div>
 
               <button
                 className="block text-2xs font-mono text-darcula-error hover:underline"
