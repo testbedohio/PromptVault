@@ -2,6 +2,11 @@ import { useState } from "react";
 import { useVersions } from "../hooks/useAppData";
 import DiffViewer from "./DiffViewer";
 import type { Prompt } from "../types";
+import {
+  exportPromptMarkdown,
+  exportPromptsJson,
+  downloadFile,
+} from "../api/commands";
 
 interface InspectorProps {
   snippet: Prompt | null;
@@ -61,6 +66,15 @@ function formatDate(iso: string): string {
   });
 }
 
+/** Slugify a prompt title for use as a filename. */
+function toFilename(title: string): string {
+  return title
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 60) || "prompt";
+}
+
 export default function Inspector({ snippet, onDelete, onSave, onOpenSync }: InspectorProps) {
   const { versions, loading: versionsLoading } = useVersions(snippet?.id ?? null);
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -72,6 +86,7 @@ export default function Inspector({ snippet, onDelete, onSave, onOpenSync }: Ins
     oldLabel: string;
     newLabel: string;
   } | null>(null);
+  const [exporting, setExporting] = useState(false);
 
   if (!snippet) {
     return (
@@ -90,8 +105,7 @@ export default function Inspector({ snippet, onDelete, onSave, onOpenSync }: Ins
 
   const wordCount = snippet.content.split(/\s+/).filter(Boolean).length;
   const charCount = snippet.content.length;
-  const lineCount = snippet.content.split("
-").length;
+  const lineCount = snippet.content.split("\n").length;
 
   const handleAddTag = async () => {
     const tag = newTag.trim().toLowerCase();
@@ -109,6 +123,34 @@ export default function Inspector({ snippet, onDelete, onSave, onOpenSync }: Ins
     await onSave(snippet.id, {
       tags: snippet.tags.filter((t) => t !== tagToRemove),
     });
+  };
+
+  // ── Export handlers ────────────────────────────────────────────
+
+  const handleExportMarkdown = async () => {
+    if (exporting) return;
+    setExporting(true);
+    try {
+      const md = await exportPromptMarkdown(snippet.id);
+      downloadFile(md, `${toFilename(snippet.title)}.md`, "text/markdown");
+    } catch (e) {
+      console.error("Export markdown failed:", e);
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  const handleExportJson = async () => {
+    if (exporting) return;
+    setExporting(true);
+    try {
+      const json = await exportPromptsJson([snippet.id]);
+      downloadFile(json, `${toFilename(snippet.title)}.json`, "application/json");
+    } catch (e) {
+      console.error("Export JSON failed:", e);
+    } finally {
+      setExporting(false);
+    }
   };
 
   return (
@@ -241,6 +283,33 @@ export default function Inspector({ snippet, onDelete, onSave, onOpenSync }: Ins
           >
             Configure →
           </button>
+        </div>
+      </Section>
+
+      {/* Export */}
+      <Section title="Export" defaultOpen={false}>
+        <div className="space-y-2">
+          <p className="text-2xs font-mono text-darcula-text-muted">
+            Download this prompt as a file.
+          </p>
+          <div className="flex gap-2">
+            <button
+              className="flex-1 text-2xs font-mono px-2 py-1.5 rounded-sm bg-darcula-bg text-darcula-accent-bright border border-darcula-border hover:border-darcula-accent transition-colors disabled:opacity-40"
+              onClick={handleExportMarkdown}
+              disabled={exporting}
+              title="Export as Markdown with YAML front-matter"
+            >
+              {exporting ? "Exporting…" : "↓ Markdown"}
+            </button>
+            <button
+              className="flex-1 text-2xs font-mono px-2 py-1.5 rounded-sm bg-darcula-bg text-darcula-accent-bright border border-darcula-border hover:border-darcula-accent transition-colors disabled:opacity-40"
+              onClick={handleExportJson}
+              disabled={exporting}
+              title="Export as JSON"
+            >
+              {exporting ? "Exporting…" : "↓ JSON"}
+            </button>
+          </div>
         </div>
       </Section>
 
