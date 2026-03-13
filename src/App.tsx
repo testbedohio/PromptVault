@@ -12,7 +12,45 @@ import SyncPanel from "./components/SyncPanel";
 import ConflictDialog from "./components/ConflictDialog";
 import UnlockDialog from "./components/UnlockDialog";
 import SetPasswordDialog from "./components/SetPasswordDialog";
-import { getConflictInfo, getSyncConfig, isSyncConnected, getDbLockStatus, type ConflictInfo } from "./api/commands";
+import ShortcutsDialog from "./components/ShortcutsDialog";
+import {
+  getConflictInfo,
+  getSyncConfig,
+  isSyncConnected,
+  getDbLockStatus,
+  getShortcuts,
+  type ConflictInfo,
+  type ShortcutMap,
+} from "./api/commands";
+
+/** Default shortcuts — kept in sync with Rust's `default_shortcuts()`. */
+const DEFAULT_SHORTCUTS: ShortcutMap = {
+  commandPalette: "Ctrl+K",
+  newPrompt:      "Ctrl+N",
+  brainSelector:  "Ctrl+B",
+  syncPanel:      "Ctrl+Shift+S",
+  shortcuts:      "Ctrl+,",
+};
+
+/**
+ * Parse an accelerator string like "Ctrl+Shift+K" into a KeyboardEvent matcher.
+ * Returns true if the given event matches the accelerator.
+ */
+function matchesAccelerator(e: KeyboardEvent, accel: string): boolean {
+  const parts = accel.split("+").map((p) => p.trim().toLowerCase());
+  const key = parts[parts.length - 1];
+  const needsCtrl  = parts.includes("ctrl");
+  const needsAlt   = parts.includes("alt");
+  const needsShift = parts.includes("shift");
+
+  const eventKey = e.key === " " ? "space" : e.key.toLowerCase();
+  return (
+    eventKey === key &&
+    (e.ctrlKey || e.metaKey) === needsCtrl &&
+    e.altKey   === needsAlt &&
+    e.shiftKey === needsShift
+  );
+}
 
 export default function App() {
   // Panel widths
@@ -25,15 +63,16 @@ export default function App() {
   const [newPromptDialogOpen, setNewPromptDialogOpen] = useState(false);
   const [brainSelectorOpen, setBrainSelectorOpen] = useState(false);
   const [syncPanelOpen, setSyncPanelOpen] = useState(false);
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [conflict, setConflict] = useState<ConflictInfo | null>(null);
 
   // Encryption state
-  // "checking" → waiting for getDbLockStatus on mount
-  // "locked"   → DB is encrypted, UnlockDialog is shown
-  // "unlocked" → key applied (or DB is plaintext), normal app flow
-  const [lockState, setLockState]           = useState<"checking" | "locked" | "unlocked">("checking");
-  const [isEncrypted, setIsEncrypted]       = useState(false);
+  const [lockState, setLockState]             = useState<"checking" | "locked" | "unlocked">("checking");
+  const [isEncrypted, setIsEncrypted]         = useState(false);
   const [setPasswordOpen, setSetPasswordOpen] = useState(false);
+
+  // Keyboard shortcuts (loaded from disk; falls back to defaults in browser mode)
+  const [shortcuts, setShortcuts] = useState<ShortcutMap>(DEFAULT_SHORTCUTS);
 
   // Data from Tauri backend (or browser fallback)
   const {
@@ -61,22 +100,28 @@ export default function App() {
   const [selectedCategory, setSelectedCategory] = useState<number | null>(null);
   const [activeTagFilter, setActiveTagFilter] = useState<string | null>(null);
 
-  // Check encryption/lock status on mount — before conflict check or embedding restore.
+  // Load encryption status on mount
   useEffect(() => {
     getDbLockStatus()
       .then((status) => {
         setIsEncrypted(status.encrypted);
         setLockState(status.unlocked ? "unlocked" : "locked");
         if (status.unlocked && !status.encrypted) {
-          // Plaintext — trigger data load immediately
           reload();
         }
       })
       .catch(() => {
-        // Browser / Tauri unavailable — treat as unlocked
         setLockState("unlocked");
       });
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Load keyboard shortcuts on mount (non-blocking — falls back to defaults)
+  useEffect(() => {
+    getShortcuts()
+      .then(setShortcuts)
+      .catch(() => { /* browser mode — use defaults */ });
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
   useEffect(() => {
     if (prompts.length > 0 && openTabs.length === 0) {
       setOpenTabs([prompts[0].id]);
@@ -85,7 +130,6 @@ export default function App() {
   }, [prompts]);
 
   // Restore the embedding index from SQLite once prompts have loaded.
-  // Fires again when the provider changes (setProvider resets restoreAttempted).
   useEffect(() => {
     if (!loading && prompts.length > 0 && !embeddings.restoreAttempted) {
       embeddings.restoreIndex();
@@ -93,7 +137,6 @@ export default function App() {
   }, [loading, prompts.length, embeddings.restoreAttempted, embeddings.restoreIndex]);
 
   // Check for a Drive conflict once on startup, after data has loaded.
-  // Only fires when the user is connected to Google Drive.
   useEffect(() => {
     if (loading) return;
     getSyncConfig()
@@ -104,9 +147,7 @@ export default function App() {
       .then((info) => {
         if (info) setConflict(info);
       })
-      .catch(() => {
-        // Network error or Tauri not available — ignore silently
-      });
+      .catch(() => {});
   }, [loading]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const filteredPrompts = prompts.filter((p) => {
@@ -204,33 +245,50 @@ export default function App() {
     };
   }, []);
 
-  // Keyboard shortcuts
+  // Dynamic keyboard shortcuts — re-registered whenever the shortcuts map changes
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === "k") {
+      // Shortcut customisation dialog takes capture priority
+      if (shortcutsOpen) return;
+
+      if (matchesAccelerator(e, shortcuts.commandPalette)) {
         e.preventDefault();
         setCommandPaletteOpen((prev) => !prev);
+        return;
       }
-      if ((e.metaKey || e.ctrlKey) && e.key === "n") {
+      if (matchesAccelerator(e, shortcuts.newPrompt)) {
         e.preventDefault();
         setNewPromptDialogOpen(true);
+        return;
       }
-      if ((e.metaKey || e.ctrlKey) && e.key === "b") {
+      if (matchesAccelerator(e, shortcuts.brainSelector)) {
         e.preventDefault();
         setBrainSelectorOpen((prev) => !prev);
+        return;
+      }
+      if (matchesAccelerator(e, shortcuts.syncPanel)) {
+        e.preventDefault();
+        setSyncPanelOpen((prev) => !prev);
+        return;
+      }
+      if (matchesAccelerator(e, shortcuts.shortcuts)) {
+        e.preventDefault();
+        setShortcutsOpen((prev) => !prev);
+        return;
       }
       if (e.key === "Escape") {
         setCommandPaletteOpen(false);
         setNewPromptDialogOpen(false);
         setBrainSelectorOpen(false);
         setSyncPanelOpen(false);
+        setShortcutsOpen(false);
       }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, []);
+  }, [shortcuts, shortcutsOpen]);
 
-  // ── Render: unlock gate (full-screen, blocks everything else) ────
+  // ── Render: unlock gate ──────────────────────────────────────────
   if (lockState === "checking") {
     return (
       <div className="flex items-center justify-center h-screen w-screen bg-darcula-bg">
@@ -287,21 +345,21 @@ export default function App() {
           <button
             className="hover:text-darcula-text transition-colors"
             onClick={() => setNewPromptDialogOpen(true)}
-            title="New Prompt (Ctrl+N)"
+            title={`New Prompt (${shortcuts.newPrompt})`}
           >
             + New
           </button>
           <button
             className="hover:text-darcula-text transition-colors"
             onClick={() => setBrainSelectorOpen(true)}
-            title="Brain Selector (Ctrl+B)"
+            title={`Brain Selector (${shortcuts.brainSelector})`}
           >
             🧠
           </button>
           <button
             className="hover:text-darcula-text transition-colors"
             onClick={() => setSyncPanelOpen(true)}
-            title="Google Drive Sync"
+            title={`Google Drive Sync (${shortcuts.syncPanel})`}
           >
             ☁
           </button>
@@ -314,8 +372,15 @@ export default function App() {
           </button>
           <button
             className="hover:text-darcula-text transition-colors"
+            onClick={() => setShortcutsOpen(true)}
+            title={`Keyboard Shortcuts (${shortcuts.shortcuts})`}
+          >
+            ⌨
+          </button>
+          <button
+            className="hover:text-darcula-text transition-colors"
             onClick={() => setCommandPaletteOpen(true)}
-            title="Command Palette (Ctrl+K)"
+            title={`Command Palette (${shortcuts.commandPalette})`}
           >
             ⌘K
           </button>
@@ -433,7 +498,6 @@ export default function App() {
           onResolved={(dataReplaced) => {
             setConflict(null);
             if (dataReplaced) {
-              // Remote DB was pulled in — reload everything from the (now-replaced) DB
               window.location.reload();
             }
           }}
@@ -448,6 +512,16 @@ export default function App() {
           onChanged={() => {
             setSetPasswordOpen(false);
             getDbLockStatus().then((s) => setIsEncrypted(s.encrypted)).catch(() => {});
+          }}
+        />
+      )}
+
+      {shortcutsOpen && (
+        <ShortcutsDialog
+          onClose={() => setShortcutsOpen(false)}
+          onSaved={(updated) => {
+            setShortcuts(updated);
+            setShortcutsOpen(false);
           }}
         />
       )}
