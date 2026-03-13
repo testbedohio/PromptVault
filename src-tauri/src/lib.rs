@@ -162,11 +162,28 @@ fn save_embedding(
     }
 }
 
+/// Load all stored embeddings for a specific provider.
+///
+/// Pass the provider name ("local", "gemini", or "voyage") to retrieve only
+/// that provider's vectors — the correct thing to do on startup or after a
+/// provider switch.  Pass an empty string to retrieve every row.
 #[tauri::command]
-fn get_all_embeddings(model: String, state: State<AppState>) -> ApiResult<Vec<StoredEmbedding>> {
-    let filter = if model.is_empty() { None } else { Some(model.as_str()) };
+fn get_all_embeddings(provider: String, state: State<AppState>) -> ApiResult<Vec<StoredEmbedding>> {
+    let filter = if provider.is_empty() { None } else { Some(provider.as_str()) };
     match state.db.lock().unwrap().get_all_embeddings(filter) {
         Ok(embeddings) => ok(embeddings),
+        Err(e) => err(&e.to_string()),
+    }
+}
+
+/// Delete all stored embeddings for a specific provider.
+///
+/// Called by the BrainSelector "Rebuild Index" button to wipe stale vectors
+/// for the active provider before re-indexing.  Other providers are untouched.
+#[tauri::command]
+fn delete_embeddings_by_provider(provider: String, state: State<AppState>) -> ApiResult<usize> {
+    match state.db.lock().unwrap().delete_embeddings_by_provider(&provider) {
+        Ok(count) => ok(count),
         Err(e) => err(&e.to_string()),
     }
 }
@@ -313,6 +330,7 @@ pub fn run() {
             search_prompts,
             save_embedding,
             get_all_embeddings,
+            delete_embeddings_by_provider,
             start_oauth_flow,
             get_sync_config,
             update_sync_config,
