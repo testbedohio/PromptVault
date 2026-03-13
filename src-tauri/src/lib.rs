@@ -109,86 +109,6 @@ fn create_salt() -> Result<Vec<u8>, String> {
     Ok(salt)
 }
 
-// ─── Shortcuts Config ─────────────────────────────────────────────────────────
-
-/// Keyboard shortcut configuration.
-///
-/// Each field is a shortcut string like "ctrl+k" or "ctrl+shift+s".
-/// An empty string means "no shortcut assigned" for that action.
-/// Persisted to `<app_data>/PromptVault/shortcuts_config.json`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ShortcutsConfig {
-    /// Open the Command Palette (default: ctrl+k)
-    #[serde(default = "default_cmd_palette")]
-    pub command_palette: String,
-    /// Create a new prompt (default: ctrl+n)
-    #[serde(default = "default_new_prompt")]
-    pub new_prompt: String,
-    /// Open the Brain Selector (default: ctrl+b)
-    #[serde(default = "default_brain_selector")]
-    pub brain_selector: String,
-    /// Toggle the Inspector panel (default: ctrl+i)
-    #[serde(default = "default_toggle_inspector")]
-    pub toggle_inspector: String,
-    /// Open the Sync Panel (default: ctrl+shift+s)
-    #[serde(default = "default_sync_panel")]
-    pub sync_panel: String,
-    /// Open the Export Dialog (default: ctrl+shift+e)
-    #[serde(default = "default_export")]
-    pub export: String,
-    /// Open Shortcuts settings (default: ctrl+,)
-    #[serde(default = "default_shortcuts")]
-    pub shortcuts: String,
-}
-
-fn default_cmd_palette()      -> String { "ctrl+k".to_string() }
-fn default_new_prompt()       -> String { "ctrl+n".to_string() }
-fn default_brain_selector()   -> String { "ctrl+b".to_string() }
-fn default_toggle_inspector() -> String { "ctrl+i".to_string() }
-fn default_sync_panel()       -> String { "ctrl+shift+s".to_string() }
-fn default_export()           -> String { "ctrl+shift+e".to_string() }
-fn default_shortcuts()        -> String { "ctrl+,".to_string() }
-
-impl Default for ShortcutsConfig {
-    fn default() -> Self {
-        ShortcutsConfig {
-            command_palette: default_cmd_palette(),
-            new_prompt: default_new_prompt(),
-            brain_selector: default_brain_selector(),
-            toggle_inspector: default_toggle_inspector(),
-            sync_panel: default_sync_panel(),
-            export: default_export(),
-            shortcuts: default_shortcuts(),
-        }
-    }
-}
-
-fn shortcuts_path() -> PathBuf {
-    let mut p = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
-    p.push("PromptVault");
-    std::fs::create_dir_all(&p).ok();
-    p.push("shortcuts_config.json");
-    p
-}
-
-fn load_shortcuts() -> ShortcutsConfig {
-    let path = shortcuts_path();
-    if path.exists() {
-        std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
-    } else {
-        ShortcutsConfig::default()
-    }
-}
-
-fn save_shortcuts_to_disk(cfg: &ShortcutsConfig) -> Result<(), String> {
-    let path = shortcuts_path();
-    let data = serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?;
-    std::fs::write(&path, data).map_err(|e| e.to_string())
-}
-
 // ─── Response Wrappers ───────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -350,151 +270,55 @@ fn delete_embeddings_by_provider(provider: String, state: State<AppState>) -> Ap
     }
 }
 
-// ─── Phase 6: SQL Vector Search ──────────────────────────────────────────────
+// ─── Vector Search (Phase 6) ─────────────────────────────────────
 
-/// Perform a SQL-level cosine similarity search using sqlite-vec's
-/// `vec_distance_cosine` function.
+/// Semantic vector search — finds the most similar stored prompts to the
+/// given query vector using Rust-side cosine similarity.
 ///
-/// Returns the top-K most similar prompts for `provider`, ordered by
-/// descending similarity (1.0 = identical direction, 0.0 = orthogonal).
+/// `provider` restricts the search to a single embedding backend so that
+/// dimension-mismatched vectors from other providers are never compared.
 ///
-/// Falls back gracefully if sqlite-vec failed to load: the frontend catches
-/// the error and uses its existing JS-side cosine similarity instead.
+/// Returns up to `top_k` results sorted by similarity descending.
+/// Returns an empty array (not an error) when no embeddings exist yet.
 #[tauri::command]
 fn vector_search(
-    query_vector: Vec<f32>,
+    vector: Vec<f32>,
     provider: String,
     top_k: usize,
     state: State<AppState>,
 ) -> ApiResult<Vec<VectorSearchResult>> {
-    if query_vector.is_empty() {
-        return err("query_vector must not be empty");
-    }
-    let top_k = top_k.max(1).min(200);
-    match state.db.lock().unwrap().vector_search(&query_vector, &provider, top_k) {
+    let top_k = top_k.max(1).min(100); // clamp to sane range
+    match state.db.lock().unwrap().vector_search(&vector, &provider, top_k) {
         Ok(results) => ok(results),
         Err(e) => err(&e.to_string()),
     }
 }
 
-// ─── Export Commands ─────────────────────────────────────────────────────────
+// ─── Export Commands ─────────────────────────────────────────────
 
-/// Export all prompts to a string in the requested format.
+/// Export a single prompt as Markdown with YAML front-matter.
 ///
-/// `format` must be one of:
-///   - `"json"` → a pretty-printed JSON document containing all prompts,
-///     categories, and tags.  Suitable for import into other tools.
-///   - `"markdown"` → a single Markdown document with one section per prompt.
-///     Suitable for browsing or sharing without PromptVault installed.
-///
-/// The returned string is meant to be delivered to the frontend, which
-/// creates a Blob and triggers a browser-style download.  No file is written
-/// to disk by this command.
+/// Returns the Markdown string — the frontend is responsible for
+/// triggering the file download (via a Blob URL) so no file-system
+/// plugin is required.
 #[tauri::command]
-fn get_export_data(format: String, state: State<AppState>) -> ApiResult<String> {
-    let db = state.db.lock().unwrap();
-
-    let prompts = match db.get_prompts() {
-        Ok(p) => p,
-        Err(e) => return err(&e.to_string()),
-    };
-
-    let categories = match db.get_categories() {
-        Ok(c) => c,
-        Err(e) => return err(&e.to_string()),
-    };
-
-    let tags = match db.get_all_tags() {
-        Ok(t) => t,
-        Err(e) => return err(&e.to_string()),
-    };
-
-    let exported_at = chrono::Utc::now().to_rfc3339();
-
-    match format.as_str() {
-        "json" => {
-            #[derive(Serialize)]
-            struct Export {
-                exported_at: String,
-                version: u32,
-                prompts: Vec<Prompt>,
-                categories: Vec<Category>,
-                tags: Vec<Tag>,
-            }
-
-            let export = Export {
-                exported_at,
-                version: 1,
-                prompts,
-                categories,
-                tags,
-            };
-
-            match serde_json::to_string_pretty(&export) {
-                Ok(json) => ok(json),
-                Err(e) => err(&e.to_string()),
-            }
-        }
-
-        "markdown" => {
-            let mut md = String::new();
-            md.push_str("# PromptVault Export\n\n");
-            md.push_str(&format!("_Exported: {}_\n\n", exported_at));
-
-            // Build a category lookup: id → name
-            let cat_map: std::collections::HashMap<i64, &str> = categories
-                .iter()
-                .map(|c| (c.id, c.name.as_str()))
-                .collect();
-
-            for prompt in &prompts {
-                md.push_str("---\n\n");
-                md.push_str(&format!("## {}\n\n", prompt.title));
-
-                if let Some(cat_id) = prompt.category_id {
-                    if let Some(cat_name) = cat_map.get(&cat_id) {
-                        md.push_str(&format!("**Category:** {}  \n", cat_name));
-                    }
-                }
-
-                if !prompt.tags.is_empty() {
-                    let tag_list = prompt.tags.iter()
-                        .map(|t| format!("#{}", t))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    md.push_str(&format!("**Tags:** {}  \n", tag_list));
-                }
-
-                md.push_str(&format!("**ID:** {}  \n", prompt.id));
-                md.push_str(&format!("**Created:** {}  \n", prompt.created_at));
-                md.push_str(&format!("**Modified:** {}  \n\n", prompt.updated_at));
-                md.push_str(&prompt.content);
-                md.push_str("\n\n");
-            }
-
-            ok(md)
-        }
-
-        _ => err(&format!("Unknown export format '{}'. Use 'json' or 'markdown'.", format)),
+fn export_prompt_markdown(id: i64, state: State<AppState>) -> ApiResult<String> {
+    match state.db.lock().unwrap().export_prompt_markdown(id) {
+        Ok(md) => ok(md),
+        Err(e) => err(&e.to_string()),
     }
 }
 
-// ─── Shortcut Commands ────────────────────────────────────────────────────────
-
-/// Load the persisted keyboard shortcuts configuration.
+/// Export all prompts (or a specific subset by ID) as a JSON array.
 ///
-/// Returns the defaults if no configuration has been saved yet.
+/// Pass an empty `ids` array to export every prompt.
+/// Returns the JSON string — the frontend triggers the download.
 #[tauri::command]
-fn get_shortcuts() -> ApiResult<ShortcutsConfig> {
-    ok(load_shortcuts())
-}
-
-/// Persist the keyboard shortcuts configuration to disk.
-#[tauri::command]
-fn save_shortcuts(config: ShortcutsConfig) -> ApiResult<bool> {
-    match save_shortcuts_to_disk(&config) {
-        Ok(_) => ok(true),
-        Err(e) => err(&e),
+fn export_prompts_json(ids: Vec<i64>, state: State<AppState>) -> ApiResult<String> {
+    let id_filter = if ids.is_empty() { None } else { Some(ids.as_slice()) };
+    match state.db.lock().unwrap().export_prompts_json(id_filter) {
+        Ok(json) => ok(json),
+        Err(e) => err(&e.to_string()),
     }
 }
 
@@ -511,8 +335,6 @@ async fn start_oauth_flow(
         let mut config = sync.get_config().clone();
         config.client_id = client_id;
         config.client_secret = client_secret;
-        // Personal mode — clear team mode flag
-        config.team_mode = false;
         if let Err(e) = sync.update_config(config) {
             return Ok(err(&e));
         }
@@ -546,81 +368,6 @@ async fn start_oauth_flow(
     });
 
     Ok(ok(auth_url))
-}
-
-/// Start the Google Drive OAuth flow with `drive.file` scope (team mode).
-///
-/// Unlike personal OAuth (which uses `drive.appdata`), team OAuth creates files
-/// in the user's regular Drive root that can be shared with teammates.
-///
-/// After the user completes sign-in, poll `get_sync_config` until
-/// `sync_status` changes to `Connected`.  Then call `sync_to_drive` to
-/// upload the vault and receive the team file ID.
-#[tauri::command]
-async fn start_team_oauth_flow(
-    client_id: String,
-    client_secret: String,
-    state: State<'_, AppState>,
-) -> Result<ApiResult<String>, ()> {
-    let auth_url = {
-        let mut sync = state.sync.lock().await;
-        let mut config = sync.get_config().clone();
-        config.client_id = client_id;
-        config.client_secret = client_secret;
-        // Enable team mode so the first upload goes to Drive root
-        config.team_mode = true;
-        if let Err(e) = sync.update_config(config) {
-            return Ok(err(&e));
-        }
-        match sync.get_team_auth_url() {
-            Ok(url) => url,
-            Err(e) => return Ok(err(&e)),
-        }
-    };
-
-    let sync_arc = Arc::clone(&state.sync);
-
-    tokio::spawn(async move {
-        match sync::await_oauth_callback().await {
-            Ok(code) => {
-                let mut sync = sync_arc.lock().await;
-                if let Err(e) = sync.exchange_code(&code).await {
-                    let mut config = sync.get_config().clone();
-                    config.sync_status = SyncStatus::Error(e.clone());
-                    sync.update_config(config).ok();
-                    eprintln!("[PromptVault] Team OAuth exchange failed: {}", e);
-                }
-            }
-            Err(e) => {
-                let mut sync = sync_arc.lock().await;
-                let mut config = sync.get_config().clone();
-                config.sync_status = SyncStatus::Error(e.clone());
-                sync.update_config(config).ok();
-                eprintln!("[PromptVault] Team OAuth callback error: {}", e);
-            }
-        }
-    });
-
-    Ok(ok(auth_url))
-}
-
-/// Connect this device to an existing shared team vault by its Drive file ID.
-///
-/// The user must already be authenticated (personal or team OAuth) before
-/// calling this. After calling, `sync_to_drive` will read/write the team file.
-#[tauri::command]
-async fn connect_team_vault(
-    file_id: String,
-    state: State<'_, AppState>,
-) -> Result<ApiResult<bool>, ()> {
-    if file_id.trim().is_empty() {
-        return Ok(err("File ID must not be empty"));
-    }
-    let mut sync = state.sync.lock().await;
-    match sync.connect_team_vault(file_id.trim()) {
-        Ok(_) => Ok(ok(true)),
-        Err(e) => Ok(err(&e)),
-    }
 }
 
 #[tauri::command]
@@ -715,11 +462,7 @@ async fn get_conflict_info(state: State<'_, AppState>) -> Result<ApiResult<Optio
     let sync = state.sync.lock().await;
     let config = sync.get_config();
 
-    // Need a file to compare against
-    let has_remote = config.remote_file_id.is_some() ||
-        (config.team_mode && config.team_file_id.is_some());
-
-    if !has_remote {
+    if config.remote_file_id.is_none() {
         return Ok(ok(None));
     }
     if !matches!(config.sync_status, SyncStatus::Connected | SyncStatus::Synced | SyncStatus::Conflict) {
@@ -943,6 +686,100 @@ fn set_db_password(
     }
 }
 
+// ─── Keyboard Shortcut Commands ───────────────────────────────────────────────
+//
+// Shortcuts are stored in <app_data>/PromptVault/shortcuts.json as a flat
+// key→accelerator map.  Unknown keys are ignored, so adding new shortcuts
+// in a future version is forward-compatible.
+//
+// Default accelerators mirror the hardcoded values that existed before this
+// feature was added, so existing users see no change on first launch.
+
+fn shortcuts_path() -> PathBuf {
+    let mut p = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
+    p.push("PromptVault");
+    std::fs::create_dir_all(&p).ok();
+    p.push("shortcuts.json");
+    p
+}
+
+fn default_shortcuts() -> std::collections::HashMap<String, String> {
+    let mut m = std::collections::HashMap::new();
+    m.insert("commandPalette".into(), "Ctrl+K".into());
+    m.insert("newPrompt".into(),      "Ctrl+N".into());
+    m.insert("brainSelector".into(),  "Ctrl+B".into());
+    m.insert("syncPanel".into(),      "Ctrl+Shift+S".into());
+    m.insert("shortcuts".into(),      "Ctrl+,".into());
+    m
+}
+
+fn load_shortcuts() -> std::collections::HashMap<String, String> {
+    let path = shortcuts_path();
+    if path.exists() {
+        if let Ok(data) = std::fs::read_to_string(&path) {
+            if let Ok(map) = serde_json::from_str(&data) {
+                // Merge with defaults so new keys always have a value
+                let mut defaults = default_shortcuts();
+                let saved: std::collections::HashMap<String, String> = map;
+                defaults.extend(saved);
+                return defaults;
+            }
+        }
+    }
+    default_shortcuts()
+}
+
+fn save_shortcuts(shortcuts: &std::collections::HashMap<String, String>) -> Result<(), String> {
+    let data = serde_json::to_string_pretty(shortcuts).map_err(|e| e.to_string())?;
+    std::fs::write(shortcuts_path(), data).map_err(|e| e.to_string())
+}
+
+/// Return the current keyboard shortcut map.
+///
+/// Keys: `commandPalette`, `newPrompt`, `brainSelector`, `syncPanel`, `shortcuts`.
+/// Values: accelerator strings like `"Ctrl+K"`, `"Ctrl+Shift+S"`.
+#[tauri::command]
+fn get_shortcuts() -> ApiResult<std::collections::HashMap<String, String>> {
+    ok(load_shortcuts())
+}
+
+/// Update a single keyboard shortcut.
+///
+/// `action` must be one of the known action keys.
+/// `accelerator` is a human-readable string like `"Ctrl+Alt+P"`.
+/// Pass an empty string to reset the action to its default.
+#[tauri::command]
+fn set_shortcut(action: String, accelerator: String) -> ApiResult<bool> {
+    let mut shortcuts = load_shortcuts();
+    let defaults = default_shortcuts();
+
+    if !defaults.contains_key(&action) {
+        return err(&format!("Unknown action: '{}'", action));
+    }
+
+    if accelerator.is_empty() {
+        // Reset to default
+        shortcuts.insert(action, defaults[&action.as_str() as &str].clone());
+    } else {
+        shortcuts.insert(action, accelerator);
+    }
+
+    match save_shortcuts(&shortcuts) {
+        Ok(_) => ok(true),
+        Err(e) => err(&e),
+    }
+}
+
+/// Reset all keyboard shortcuts to their defaults.
+#[tauri::command]
+fn reset_shortcuts() -> ApiResult<std::collections::HashMap<String, String>> {
+    let defaults = default_shortcuts();
+    match save_shortcuts(&defaults) {
+        Ok(_) => ok(defaults),
+        Err(e) => err(&e),
+    }
+}
+
 // ─── App Entry ───────────────────────────────────────────────────
 
 pub fn run() {
@@ -975,7 +812,6 @@ pub fn run() {
             db_locked,
         })
         .invoke_handler(tauri::generate_handler![
-            // Data
             get_categories,
             create_category,
             get_prompts,
@@ -986,18 +822,12 @@ pub fn run() {
             get_prompt_versions,
             get_all_tags,
             search_prompts,
-            // Embeddings
             save_embedding,
             get_all_embeddings,
             delete_embeddings_by_provider,
-            // Phase 6: SQL vector search
             vector_search,
-            // Export
-            get_export_data,
-            // Shortcuts
-            get_shortcuts,
-            save_shortcuts,
-            // Sync (personal)
+            export_prompt_markdown,
+            export_prompts_json,
             start_oauth_flow,
             get_sync_config,
             update_sync_config,
@@ -1006,16 +836,14 @@ pub fn run() {
             sync_to_drive,
             check_sync_status,
             set_auto_sync,
-            // Sync (team)
-            start_team_oauth_flow,
-            connect_team_vault,
-            // Conflict
             get_conflict_info,
             resolve_conflict,
-            // Encryption
             get_db_lock_status,
             unlock_database,
             set_db_password,
+            get_shortcuts,
+            set_shortcut,
+            reset_shortcuts,
         ])
         .run(tauri::generate_context!())
         .expect("error while running PromptVault");
