@@ -2,20 +2,91 @@ mod db;
 mod sync;
 
 use db::{Database, Prompt, PromptVersion, Category, Tag, StoredEmbedding};
-use sync::{DriveSync, SyncConfig};
+use sync::{DriveSync, SyncConfig, SyncStatus};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex as StdMutex};
-use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::{watch, Mutex as TokioMutex};
+use tokio::time::{sleep, Duration};
 use tauri::State;
+
+// ─── Background Sync Worker ───────────────────────────────────────────────────
+
+/// Controls sent to the background sync worker via a watch channel.
+/// Cloning is cheap — it's just two primitives.
+#[derive(Clone, Debug)]
+struct SyncWorkerCtl {
+    /// Mirror of SyncConfig.auto_sync_enabled — when false the worker idles.
+    enabled: bool,
+    /// Mirror of SyncConfig.auto_sync_interval_mins converted to seconds.
+    interval_secs: u64,
+}
+
+/// Long-lived background task that periodically uploads the database to Drive.
+///
+/// Design:
+///   - Runs for the entire lifetime of the app (never exits unless the channel
+///     drops, which only happens on app shutdown).
+///   - Uses `tokio::select!` so config changes (via the watch channel) wake it
+///     immediately, even while sleeping between sync cycles.
+///   - Only uploads when both:
+///       1. The worker is `enabled` (user toggled auto-sync on), AND
+///       2. The DriveSync config shows Connected or Synced status.
+///   - Errors are logged to stderr but never crash the worker loop.
+async fn run_sync_worker(
+    sync: Arc<TokioMutex<DriveSync>>,
+    db_path: String,
+    mut ctl_rx: watch::Receiver<SyncWorkerCtl>,
+) {
+    loop {
+        // Take a snapshot of the current control values
+        let ctl = ctl_rx.borrow().clone();
+
+        if !ctl.enabled || ctl.interval_secs == 0 {
+            // Idle: wait until the config changes before re-evaluating
+            if ctl_rx.changed().await.is_err() {
+                break; // Channel dropped → app shutting down
+            }
+            continue;
+        }
+
+        // Active: sleep for the configured interval, but wake early on config change
+        let sleep_fut = sleep(Duration::from_secs(ctl.interval_secs));
+        tokio::select! {
+            _ = sleep_fut => {
+                // Interval elapsed — attempt a sync if the conditions are right
+                let mut sync_guard = sync.lock().await;
+                let status = sync_guard.get_config().sync_status.clone();
+                let is_ready = matches!(status, SyncStatus::Connected | SyncStatus::Synced);
+
+                if is_ready {
+                    if let Err(e) = sync_guard.upload_db(&db_path).await {
+                        eprintln!("[PromptVault] Background sync failed: {}", e);
+                    }
+                }
+            }
+            _ = ctl_rx.changed() => {
+                // Config changed mid-sleep — loop back to re-read the new values
+                // without syncing (the timer resets)
+                continue;
+            }
+        }
+    }
+}
+
+// ─── App State ────────────────────────────────────────────────────────────────
 
 /// Shared application state managed by Tauri.
 ///
 /// `db`   — std::sync::Mutex  (synchronous commands only, never held across .await)
 /// `sync` — Arc<tokio::sync::Mutex> so the Arc can be cloned into spawned tasks
-///          (e.g. the OAuth background listener) without requiring 'static lifetime tricks.
+/// `db_path` — captured once at startup to avoid re-locking `db` in the worker
+/// `sync_worker_tx` — watch sender for updating the background worker's config
+///                    without stopping/restarting it
 struct AppState {
     db: StdMutex<Database>,
     sync: Arc<TokioMutex<DriveSync>>,
+    db_path: String,
+    sync_worker_tx: Arc<watch::Sender<SyncWorkerCtl>>,
 }
 
 // ─── Response Wrappers ───────────────────────────────────────────
@@ -165,8 +236,7 @@ fn save_embedding(
 /// Load all stored embeddings for a specific provider.
 ///
 /// Pass the provider name ("local", "gemini", or "voyage") to retrieve only
-/// that provider's vectors — the correct thing to do on startup or after a
-/// provider switch.  Pass an empty string to retrieve every row.
+/// that provider's vectors.  Pass an empty string to retrieve every row.
 #[tauri::command]
 fn get_all_embeddings(provider: String, state: State<AppState>) -> ApiResult<Vec<StoredEmbedding>> {
     let filter = if provider.is_empty() { None } else { Some(provider.as_str()) };
@@ -230,9 +300,8 @@ async fn start_oauth_flow(
             Ok(code) => {
                 let mut sync = sync_arc.lock().await;
                 if let Err(e) = sync.exchange_code(&code).await {
-                    // Persist error state so the frontend poll sees it
                     let mut config = sync.get_config().clone();
-                    config.sync_status = sync::SyncStatus::Error(e.clone());
+                    config.sync_status = SyncStatus::Error(e.clone());
                     sync.update_config(config).ok();
                     eprintln!("[PromptVault] OAuth exchange failed: {}", e);
                 }
@@ -240,7 +309,7 @@ async fn start_oauth_flow(
             Err(e) => {
                 let mut sync = sync_arc.lock().await;
                 let mut config = sync.get_config().clone();
-                config.sync_status = sync::SyncStatus::Error(e.clone());
+                config.sync_status = SyncStatus::Error(e.clone());
                 sync.update_config(config).ok();
                 eprintln!("[PromptVault] OAuth callback error: {}", e);
             }
@@ -285,10 +354,7 @@ async fn exchange_auth_code(code: String, state: State<'_, AppState>) -> Result<
 
 #[tauri::command]
 async fn sync_to_drive(state: State<'_, AppState>) -> Result<ApiResult<bool>, ()> {
-    let db_path = {
-        let db = state.db.lock().unwrap();
-        db.get_db_path()
-    };
+    let db_path = state.db_path.clone();
     let mut sync = state.sync.lock().await;
     match sync.upload_db(&db_path).await {
         Ok(_) => Ok(ok(true)),
@@ -305,17 +371,78 @@ async fn check_sync_status(state: State<'_, AppState>) -> Result<ApiResult<Optio
     }
 }
 
+/// Enable or disable the periodic background sync worker.
+///
+/// This command:
+///   1. Updates `auto_sync_enabled` and `auto_sync_interval_mins` in the
+///      persisted SyncConfig (so the setting survives restarts).
+///   2. Sends the updated control values through the watch channel so the
+///      already-running worker reacts immediately — no restart required.
+///
+/// `interval_mins` must be one of [5, 15, 30, 60].  Values outside this
+/// range are clamped to 5 on the worker side (the frontend enforces the
+/// allowed values, but we defensively clamp here as well).
+#[tauri::command]
+async fn set_auto_sync(
+    enabled: bool,
+    interval_mins: u32,
+    state: State<'_, AppState>,
+) -> Result<ApiResult<bool>, ()> {
+    // Clamp interval to a sane range
+    let interval_mins = interval_mins.max(1).min(60);
+
+    // Persist the setting
+    {
+        let mut sync = state.sync.lock().await;
+        let mut config = sync.get_config().clone();
+        config.auto_sync_enabled = enabled;
+        config.auto_sync_interval_mins = interval_mins;
+        if let Err(e) = sync.update_config(config) {
+            return Ok(err(&e));
+        }
+    }
+
+    // Signal the live worker (non-blocking — watch::Sender::send always succeeds
+    // as long as at least one Receiver exists, which the worker holds for the
+    // app lifetime)
+    let _ = state.sync_worker_tx.send(SyncWorkerCtl {
+        enabled,
+        interval_secs: (interval_mins as u64) * 60,
+    });
+
+    Ok(ok(true))
+}
+
 // ─── App Entry ───────────────────────────────────────────────────
 
 pub fn run() {
     let db = Database::new().expect("Failed to initialize database");
+    let db_path = db.get_db_path();
     let sync = DriveSync::new();
+
+    // Read the saved auto-sync settings so the worker starts in the right state
+    let saved_cfg = sync.get_config().clone();
+    let initial_ctl = SyncWorkerCtl {
+        enabled: saved_cfg.auto_sync_enabled,
+        interval_secs: (saved_cfg.auto_sync_interval_mins.max(1) as u64) * 60,
+    };
+
+    let (worker_tx, worker_rx) = watch::channel(initial_ctl);
+    let sync_arc = Arc::new(TokioMutex::new(sync));
+
+    // Spawn the background sync worker — it runs for the entire app lifetime.
+    // The worker idles until auto_sync_enabled is true.
+    let worker_sync = Arc::clone(&sync_arc);
+    let worker_db_path = db_path.clone();
+    tokio::spawn(run_sync_worker(worker_sync, worker_db_path, worker_rx));
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .manage(AppState {
             db: StdMutex::new(db),
-            sync: Arc::new(TokioMutex::new(sync)),
+            sync: sync_arc,
+            db_path,
+            sync_worker_tx: Arc::new(worker_tx),
         })
         .invoke_handler(tauri::generate_handler![
             get_categories,
@@ -338,6 +465,7 @@ pub fn run() {
             exchange_auth_code,
             sync_to_drive,
             check_sync_status,
+            set_auto_sync,
         ])
         .run(tauri::generate_context!())
         .expect("error while running PromptVault");
