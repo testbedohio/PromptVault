@@ -63,8 +63,10 @@ pub struct StoredEmbedding {
     pub provider: String,
 }
 
-/// A result from the SQL-level vector similarity search.
-/// `similarity` is in [0.0, 1.0] where 1.0 = identical direction.
+/// Result from a Rust-side vector similarity search.
+///
+/// `similarity` is cosine similarity in [0, 1] — higher is more similar.
+/// Returned sorted descending by similarity.
 #[derive(Debug, Serialize, Clone)]
 pub struct VectorSearchResult {
     pub prompt_id: i64,
@@ -87,34 +89,19 @@ fn blob_to_floats(b: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-// ─── sqlite-vec Extension ────────────────────────────────────────
-
-/// Attempt to load the sqlite-vec extension into an open connection.
-///
-/// sqlite-vec provides `vec_distance_cosine(a, b)` and related functions
-/// for SQL-level vector similarity queries. Our existing BLOB format
-/// (raw little-endian f32 bytes) is wire-compatible with sqlite-vec's
-/// expected input, so no data migration is required.
-///
-/// Loading is best-effort: if the extension fails to register (e.g. due
-/// to a build environment that excludes dynamic extension loading),
-/// the application continues normally and the JS-side cosine similarity
-/// in useEmbeddings.ts is used as a fallback.
-fn try_load_sqlite_vec(conn: &Connection) {
-    unsafe {
-        let rc = sqlite_vec::sqlite3_auto_init(
-            conn.handle(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        );
-        if rc != 0 {
-            eprintln!(
-                "[PromptVault] sqlite-vec extension failed to load (rc={}). \
-                 SQL vector search unavailable; JS-side similarity is the fallback.",
-                rc
-            );
-        }
+/// Compute cosine similarity between two equal-length f32 slices.
+/// Returns 0.0 if either vector has zero magnitude or lengths differ.
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() {
+        return 0.0;
     }
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm_a == 0.0 || norm_b == 0.0 {
+        return 0.0;
+    }
+    dot / (norm_a * norm_b)
 }
 
 // ─── Database Implementation ─────────────────────────────────────
@@ -123,10 +110,6 @@ impl Database {
     pub fn new() -> Result<Self> {
         let path = db_path();
         let conn = Connection::open(&path)?;
-
-        // Load sqlite-vec before any other setup so vec_* functions are
-        // available for the schema initialisation queries if needed.
-        try_load_sqlite_vec(&conn);
 
         // Enable WAL mode for better concurrent read performance
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
@@ -439,6 +422,7 @@ impl Database {
         }
 
         if let Some(c) = content {
+            // Get next version number
             let next_version: i32 = self.conn.query_row(
                 "SELECT COALESCE(MAX(version_number), 0) + 1 FROM prompt_versions WHERE prompt_id = ?1",
                 params![id],
@@ -456,6 +440,7 @@ impl Database {
                 params![now, id],
             )?;
 
+            // Rebuild FTS entry
             let current_title: String = self.conn.query_row(
                 "SELECT title FROM prompts WHERE id = ?1", params![id], |row| row.get(0),
             )?;
@@ -522,12 +507,14 @@ impl Database {
     }
 
     fn set_tags_for_prompt(&self, prompt_id: i64, tags: &[String]) -> Result<()> {
+        // Clear existing
         self.conn.execute(
             "DELETE FROM prompt_tags WHERE prompt_id = ?1",
             params![prompt_id],
         )?;
 
         for tag_name in tags {
+            // Upsert tag
             self.conn.execute(
                 "INSERT OR IGNORE INTO tags (name) VALUES (?1)",
                 params![tag_name],
@@ -548,6 +535,7 @@ impl Database {
     // ── Search ───────────────────────────────────────────────────
 
     pub fn search_prompts(&self, query: &str) -> Result<Vec<Prompt>> {
+        // Use FTS5 for keyword search
         let fts_query = query
             .split_whitespace()
             .map(|w| format!("\"{}\"", w.replace('"', "")))
@@ -655,70 +643,129 @@ impl Database {
         Ok(count)
     }
 
-    // ── SQL Vector Search (Phase 6) ───────────────────────────────
+    // ── Vector Search (Phase 6) ───────────────────────────────────
     //
-    // Uses sqlite-vec's `vec_distance_cosine(a, b)` function, which must have
-    // been loaded via `try_load_sqlite_vec` at connection open time.
+    // Rust-side cosine similarity search over stored embeddings.
     //
-    // vec_distance_cosine returns a cosine *distance* in [0, 2] (0 = identical
-    // direction, 2 = opposite).  We convert to a similarity score in [0, 1]:
-    //   similarity = max(0, 1 - distance)
+    // Strategy: load all vector BLOBs for the given provider from SQLite,
+    // score each against the query vector using the `cosine_similarity` helper,
+    // sort descending, and return the top-k results.
     //
-    // Results are ordered most-similar first (smallest distance ascending).
-    // This is equivalent to the JS-side cosine similarity in useEmbeddings.ts,
-    // but runs entirely in SQLite with no round-trip to the frontend.
-    //
-    // Falls back gracefully: if sqlite-vec didn't load, this query will fail
-    // with "no such function: vec_distance_cosine", which the Tauri command
-    // converts to an error that the frontend catches and handles by using the
-    // existing JS-side search instead.
+    // This keeps scoring in Rust (no JS round-trip) and is wire-compatible with
+    // the existing BLOB format, so migrating to sqlite-vec SQL functions later
+    // is a schema-only change with no data migration required.
 
-    /// Find the `top_k` most-similar embeddings to `query_vector` for the given
-    /// provider, using SQL-level cosine distance.
+    /// Find the most semantically similar prompts to `query_vector`.
     ///
-    /// Returns `(prompt_id, similarity)` pairs ordered by descending similarity.
+    /// - `provider`: filters to only the rows for the active embedding backend.
+    /// - `top_k`: maximum number of results to return (sorted by similarity desc).
+    ///
+    /// Returns an empty Vec (not an error) when no embeddings are stored yet.
     pub fn vector_search(
         &self,
         query_vector: &[f32],
         provider: &str,
         top_k: usize,
     ) -> Result<Vec<VectorSearchResult>> {
-        let blob = floats_to_blob(query_vector);
+        if query_vector.is_empty() || top_k == 0 {
+            return Ok(vec![]);
+        }
+
         let mut stmt = self.conn.prepare(
-            "SELECT prompt_id,
-                    CAST(vec_distance_cosine(vector, ?1) AS REAL) AS dist
-             FROM embeddings
-             WHERE provider = ?2
-               AND dimensions = ?3
-             ORDER BY dist ASC
-             LIMIT ?4"
+            "SELECT prompt_id, vector FROM embeddings WHERE provider = ?1"
         )?;
 
-        let dims = query_vector.len() as i64;
-        let rows = stmt.query_map(params![blob, provider, dims, top_k as i64], |row| {
-            let prompt_id: i64 = row.get(0)?;
-            let dist: f64 = row.get(1)?;
-            // Convert cosine distance [0, 2] → similarity [0, 1]
-            let similarity = ((1.0 - dist) as f32).max(0.0);
-            Ok(VectorSearchResult { prompt_id, similarity })
-        })?;
+        let mut results: Vec<VectorSearchResult> = stmt
+            .query_map(params![provider], |row| {
+                let prompt_id: i64 = row.get(0)?;
+                let blob: Vec<u8> = row.get(1)?;
+                Ok((prompt_id, blob))
+            })?
+            .filter_map(|r| r.ok())
+            .filter_map(|(prompt_id, blob)| {
+                let stored = blob_to_floats(&blob);
+                // Skip vectors with mismatched dimensions (different model was used)
+                if stored.len() != query_vector.len() {
+                    return None;
+                }
+                let similarity = cosine_similarity(query_vector, &stored);
+                Some(VectorSearchResult { prompt_id, similarity })
+            })
+            .collect();
 
-        rows.collect()
+        // Sort descending by similarity
+        results.sort_by(|a, b| {
+            b.similarity
+                .partial_cmp(&a.similarity)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        results.truncate(top_k);
+
+        Ok(results)
+    }
+
+    // ── Export ───────────────────────────────────────────────────
+
+    /// Export a single prompt as a Markdown string.
+    ///
+    /// Format: YAML front-matter (title, tags, dates) followed by the
+    /// prompt content. Safe to write directly to a `.md` file.
+    pub fn export_prompt_markdown(&self, id: i64) -> Result<String> {
+        let prompt = self.get_prompt_by_id(id)?;
+
+        let tags_yaml = if prompt.tags.is_empty() {
+            "[]".to_string()
+        } else {
+            format!(
+                "[{}]",
+                prompt.tags.iter().map(|t| format!("\"{}\"", t)).collect::<Vec<_>>().join(", ")
+            )
+        };
+
+        let md = format!(
+            "---\ntitle: \"{}\"\ntags: {}\ncreated: {}\nupdated: {}\n---\n\n{}",
+            prompt.title.replace('"', "\\\""),
+            tags_yaml,
+            prompt.created_at,
+            prompt.updated_at,
+            prompt.content,
+        );
+
+        Ok(md)
+    }
+
+    /// Export all prompts as a JSON array string.
+    ///
+    /// Each entry includes title, tags, timestamps, and the latest content.
+    /// Suitable for backup, import into other tools, or bulk processing.
+    pub fn export_prompts_json(&self, ids: Option<&[i64]>) -> Result<String> {
+        let prompts = match ids {
+            Some(id_list) => {
+                let mut result = Vec::new();
+                for &id in id_list {
+                    result.push(self.get_prompt_by_id(id)?);
+                }
+                result
+            }
+            None => self.get_prompts()?,
+        };
+
+        // Build JSON manually to avoid pulling in a macro; serde_json is already a dep.
+        // We re-use serde_json via the Serialize derive on Prompt.
+        let json = serde_json::to_string_pretty(&prompts)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+
+        Ok(json)
     }
 
     // ── SQLCipher key management ──────────────────────────────────
 
-    /// Apply the SQLCipher decryption key to this connection.
-    ///
-    /// **Must be called before any other statement on an encrypted database.**
-    /// Returns `Err` if the key is wrong (subsequent sqlite_master read fails).
     pub fn apply_key(&self, key_hex: &str) -> Result<()> {
         self.conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";\n", key_hex))?;
         self.conn.execute_batch("SELECT count(*) FROM sqlite_master;")?;
         Ok(())
     }
 
-    /// Re-key the database (encrypt plaintext DB, change key, or remove encryption).
     pub fn rekey(&self, new_key_hex: Option<&str>) -> Result<()> {
         let pragma = match new_key_hex {
             Some(hex) => format!("PRAGMA rekey = \"x'{}'\";", hex),
@@ -730,8 +777,6 @@ impl Database {
 
     // ── Conflict resolution ───────────────────────────────────────
 
-    /// Replace the contents of the live database connection with those from a
-    /// SQLite file at `source_path`, using SQLite's online backup API.
     pub fn restore_from(&mut self, source_path: &str) -> Result<()> {
         use rusqlite::backup::{Backup, StepResult};
         use std::time::Duration;
