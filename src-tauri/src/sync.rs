@@ -16,30 +16,21 @@ pub struct SyncConfig {
     pub last_sync: Option<String>,
     pub sync_status: SyncStatus,
     /// Whether the periodic background sync worker should run.
+    /// Separate from `enabled` (which means OAuth is configured).
     #[serde(default)]
     pub auto_sync_enabled: bool,
     /// How often the background worker uploads, in minutes. Default: 5.
     #[serde(default = "default_interval")]
     pub auto_sync_interval_mins: u32,
-
-    // ── Team / Shared Vault ──────────────────────────────────────
-    //
-    // When `team_mode` is true, PromptVault syncs to a regular Drive file
-    // (drive.file scope) identified by `team_file_id`.  This file can be
-    // shared with teammates via the normal Google Drive sharing UI.
-    //
-    // When `team_mode` is false (default), the app uses the private
-    // appDataFolder (drive.appdata scope) stored in `remote_file_id`.
-    //
-    // Switching modes requires re-authorising with the appropriate scope.
-
-    /// True when team mode (drive.file scope, shared vault) is active.
+    /// Whether team/shared-vault mode is active.
+    /// In team mode, the DB is synced to `team_file_id` instead of
+    /// the hidden appDataFolder.  This file can be shared with teammates
+    /// via Google Drive's standard sharing UI.
     #[serde(default)]
     pub team_mode: bool,
-
-    /// Drive file ID for the shared vault (team mode only).
-    /// Set automatically after the first team upload, or manually
-    /// via `connect_team_vault` when joining an existing vault.
+    /// Drive File ID of the shared team vault.
+    /// Set by the vault creator (returned after upload) or by a teammate
+    /// who was given the ID and called `connect_team_vault`.
     #[serde(default)]
     pub team_file_id: Option<String>,
 }
@@ -176,6 +167,8 @@ const ERROR_HTML: &str = r#"<!DOCTYPE html>
 </body>
 </html>"#;
 
+/// Start a one-shot HTTP listener on localhost:8741 and wait for the Google
+/// OAuth callback. Returns the authorization code on success.
 pub async fn await_oauth_callback() -> Result<String, String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -200,7 +193,6 @@ pub async fn await_oauth_callback() -> Result<String, String> {
         .map_err(|e| format!("Failed to read callback: {}", e))?;
 
     let request = String::from_utf8_lossy(&buf[..n]);
-
     let request_line = request.lines().next().unwrap_or("");
     let path_and_query = request_line.split_whitespace().nth(1).unwrap_or("");
     let query_string = path_and_query.split('?').nth(1).unwrap_or("");
@@ -260,9 +252,9 @@ impl DriveSync {
         Ok(())
     }
 
-    // ── OAuth URL Builders ────────────────────────────────────────
+    // ── Personal OAuth ────────────────────────────────────────────
 
-    /// Build the personal mode OAuth URL (drive.appdata scope — hidden, per-user folder).
+    /// Build the Google OAuth 2.0 authorization URL for personal (appDataFolder) sync.
     pub fn get_auth_url(&self) -> Result<String, String> {
         if self.config.client_id.is_empty() {
             return Err("Client ID not configured".to_string());
@@ -270,11 +262,13 @@ impl DriveSync {
         self.build_auth_url("https://www.googleapis.com/auth/drive.appdata")
     }
 
-    /// Build the team mode OAuth URL (drive.file scope — can create/access shared files).
+    // ── Team OAuth ────────────────────────────────────────────────
+
+    /// Build the Google OAuth 2.0 authorization URL for team (drive.file) sync.
     ///
-    /// Unlike `drive.appdata`, `drive.file` grants access to files created by
-    /// PromptVault in the user's regular Drive, which can then be shared with
-    /// teammates via normal Drive sharing.
+    /// `drive.file` scope allows reading and writing files created by this app
+    /// in the user's regular Drive root, making them shareable with teammates
+    /// via Google Drive's standard sharing UI.
     pub fn get_team_auth_url(&self) -> Result<String, String> {
         if self.config.client_id.is_empty() {
             return Err("Client ID not configured".to_string());
@@ -298,8 +292,20 @@ impl DriveSync {
         ))
     }
 
-    // ── Token Exchange & Refresh ──────────────────────────────────
+    /// Connect this device to an existing team vault by storing its Drive file ID.
+    ///
+    /// The user must already be authenticated (personal or team OAuth) before
+    /// calling this.  After calling, `sync_to_drive` / `upload_db` will use
+    /// `team_file_id` and `team_mode = true`.
+    pub fn connect_team_vault(&mut self, file_id: &str) -> Result<(), String> {
+        self.config.team_mode = true;
+        self.config.team_file_id = Some(file_id.to_string());
+        self.config.save()
+    }
 
+    // ── Token Management ──────────────────────────────────────────
+
+    /// Exchange an authorization code for access + refresh tokens.
     pub async fn exchange_code(&mut self, code: &str) -> Result<(), String> {
         let redirect = format!("http://localhost:{}/callback", CALLBACK_PORT);
         let client = reqwest::Client::new();
@@ -342,6 +348,7 @@ impl DriveSync {
         Ok(())
     }
 
+    /// Refresh an expired access token using the stored refresh token.
     pub async fn refresh_access_token(&mut self) -> Result<(), String> {
         let refresh_token = self
             .config
@@ -382,6 +389,7 @@ impl DriveSync {
         Ok(())
     }
 
+    /// Ensure we have a valid access token, refreshing if it's expired or close to expiry.
     pub async fn ensure_fresh_token(&mut self) -> Result<(), String> {
         let expiry = self.config.token_expiry.unwrap_or(0);
         if Utc::now().timestamp() + 60 >= expiry {
@@ -390,22 +398,21 @@ impl DriveSync {
         Ok(())
     }
 
-    // ── Upload ────────────────────────────────────────────────────
-    //
-    // Routes to personal (appDataFolder) or team (drive.file) based on
-    // the `team_mode` flag in the config.
+    // ── Upload (Personal + Team) ──────────────────────────────────
 
+    /// Upload the database to Google Drive.
+    ///
+    /// When `team_mode` is true and a `team_file_id` is set, the upload targets
+    /// that shared file.  Otherwise it targets the hidden appDataFolder file.
     pub async fn upload_db(&mut self, db_path: &str) -> Result<(), String> {
         if self.config.team_mode {
-            self.upload_db_team(db_path).await
+            self.upload_team_db(db_path).await
         } else {
-            self.upload_db_personal(db_path).await
+            self.upload_personal_db(db_path).await
         }
     }
 
-    /// Personal sync: upload to the hidden appDataFolder.
-    /// File is not visible in the user's regular Drive view.
-    async fn upload_db_personal(&mut self, db_path: &str) -> Result<(), String> {
+    async fn upload_personal_db(&mut self, db_path: &str) -> Result<(), String> {
         self.ensure_fresh_token().await?;
 
         let token = self
@@ -441,6 +448,7 @@ impl DriveSync {
                 return Err(format!("Upload failed: {}", err));
             }
         } else {
+            // Create new file in appDataFolder
             let metadata = serde_json::json!({
                 "name": "prompt_vault.db",
                 "parents": ["appDataFolder"]
@@ -489,12 +497,12 @@ impl DriveSync {
         Ok(())
     }
 
-    /// Team sync: upload to a regular Drive file (visible, shareable).
+    /// Upload to the shared team vault file.
     ///
-    /// On first use, creates a new file and stores its ID in `team_file_id`.
-    /// Subsequent uploads patch the same file.  The ID can be shared with
-    /// teammates who then call `connect_team_vault` to link their local vault.
-    async fn upload_db_team(&mut self, db_path: &str) -> Result<(), String> {
+    /// If `team_file_id` is already set, PATCHes the existing file.
+    /// If not set (first team upload), creates a file in Drive root (not in
+    /// appDataFolder) so the user can share it with teammates.
+    async fn upload_team_db(&mut self, db_path: &str) -> Result<(), String> {
         self.ensure_fresh_token().await?;
 
         let token = self
@@ -510,7 +518,7 @@ impl DriveSync {
         self.config.sync_status = SyncStatus::Syncing;
 
         if let Some(ref file_id) = self.config.team_file_id.clone() {
-            // Update existing shared file
+            // Update existing team file
             let url = format!(
                 "https://www.googleapis.com/upload/drive/v3/files/{}?uploadType=media",
                 file_id
@@ -531,13 +539,14 @@ impl DriveSync {
                 return Err(format!("Team upload failed: {}", err));
             }
         } else {
-            // Create a new shared file in Drive root (no parent = My Drive root)
+            // Create new team file in Drive root (shareable)
+            // Note: no "parents" → goes to "My Drive" root by default
             let metadata = serde_json::json!({
-                "name": "prompt_vault_shared.db",
-                "description": "PromptVault shared prompt database"
+                "name": "PromptVault_Team.db",
+                "description": "PromptVault shared team vault — share this file to collaborate"
             });
 
-            let boundary = "promptvault_team_boundary";
+            let boundary = "prompt_vault_team_boundary";
             let header_part = format!(
                 "--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{}\r\n--{boundary}\r\nContent-Type: application/x-sqlite3\r\n\r\n",
                 metadata
@@ -562,9 +571,9 @@ impl DriveSync {
 
             if !response.status().is_success() {
                 let err = response.text().await.unwrap_or_default();
-                self.config.sync_status = SyncStatus::Error(format!("Team vault create failed: {}", err));
+                self.config.sync_status = SyncStatus::Error(format!("Team create failed: {}", err));
                 self.config.save().ok();
-                return Err(format!("Team vault create failed: {}", err));
+                return Err(format!("Team create failed: {}", err));
             }
 
             #[derive(Deserialize)]
@@ -581,19 +590,20 @@ impl DriveSync {
     }
 
     // ── Download ──────────────────────────────────────────────────
-    //
-    // Routes to the correct file ID based on team_mode.
 
     /// Download the remote database file to `dest_path`.
+    ///
+    /// In team mode, downloads from `team_file_id`.
+    /// In personal mode, downloads from `remote_file_id`.
     pub async fn download_db(&mut self, dest_path: &str) -> Result<(), String> {
-        if self.config.team_mode {
-            self.download_db_team(dest_path).await
+        if self.config.team_mode && self.config.team_file_id.is_some() {
+            self.download_team_db(dest_path).await
         } else {
-            self.download_db_personal(dest_path).await
+            self.download_personal_db(dest_path).await
         }
     }
 
-    async fn download_db_personal(&mut self, dest_path: &str) -> Result<(), String> {
+    async fn download_personal_db(&mut self, dest_path: &str) -> Result<(), String> {
         self.ensure_fresh_token().await?;
 
         let token = self
@@ -610,30 +620,6 @@ impl DriveSync {
             .ok_or("No remote file ID — cannot download")?
             .clone();
 
-        self.download_file_by_id(&token, &file_id, dest_path).await
-    }
-
-    async fn download_db_team(&mut self, dest_path: &str) -> Result<(), String> {
-        self.ensure_fresh_token().await?;
-
-        let token = self
-            .config
-            .access_token
-            .as_ref()
-            .ok_or("Not authenticated")?
-            .clone();
-
-        let file_id = self
-            .config
-            .team_file_id
-            .as_ref()
-            .ok_or("No team vault file ID — use 'Connect to existing vault' to link one")?
-            .clone();
-
-        self.download_file_by_id(&token, &file_id, dest_path).await
-    }
-
-    async fn download_file_by_id(&self, token: &str, file_id: &str, dest_path: &str) -> Result<(), String> {
         let client = reqwest::Client::new();
         let url = format!(
             "https://www.googleapis.com/drive/v3/files/{}?alt=media",
@@ -642,7 +628,7 @@ impl DriveSync {
 
         let response = client
             .get(&url)
-            .bearer_auth(token)
+            .bearer_auth(&token)
             .send()
             .await
             .map_err(|e| e.to_string())?;
@@ -658,10 +644,51 @@ impl DriveSync {
         Ok(())
     }
 
-    // ── Remote Status Check ───────────────────────────────────────
-    //
-    // Returns the modifiedTime of the active remote file (personal or team).
+    async fn download_team_db(&mut self, dest_path: &str) -> Result<(), String> {
+        self.ensure_fresh_token().await?;
 
+        let token = self
+            .config
+            .access_token
+            .as_ref()
+            .ok_or("Not authenticated")?
+            .clone();
+
+        let file_id = self
+            .config
+            .team_file_id
+            .as_ref()
+            .ok_or("No team file ID — cannot download")?
+            .clone();
+
+        let client = reqwest::Client::new();
+        let url = format!(
+            "https://www.googleapis.com/drive/v3/files/{}?alt=media",
+            file_id
+        );
+
+        let response = client
+            .get(&url)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if !response.status().is_success() {
+            let err = response.text().await.unwrap_or_default();
+            return Err(format!("Team download failed: {}", err));
+        }
+
+        let bytes = response.bytes().await.map_err(|e| e.to_string())?;
+        fs::write(dest_path, &bytes).map_err(|e| e.to_string())?;
+
+        Ok(())
+    }
+
+    // ── Remote Status ─────────────────────────────────────────────
+
+    /// Check whether the remote file is newer than the last local sync.
+    /// Returns the remote ISO 8601 modifiedTime string if the file exists.
     pub async fn check_remote_status(&self) -> Result<Option<String>, String> {
         let token = self
             .config
@@ -669,16 +696,11 @@ impl DriveSync {
             .as_ref()
             .ok_or("Not authenticated")?;
 
+        // Use team_file_id when in team mode, otherwise remote_file_id
         let file_id = if self.config.team_mode {
-            self.config
-                .team_file_id
-                .as_ref()
-                .ok_or("No team file ID")?
+            self.config.team_file_id.as_ref().ok_or("No team file")?
         } else {
-            self.config
-                .remote_file_id
-                .as_ref()
-                .ok_or("No remote file")?
+            self.config.remote_file_id.as_ref().ok_or("No remote file")?
         };
 
         let client = reqwest::Client::new();
