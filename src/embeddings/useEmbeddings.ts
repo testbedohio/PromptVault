@@ -7,7 +7,7 @@ import {
   type EmbeddingProvider,
   type EmbeddingResult,
 } from "./service";
-import { saveEmbedding, getAllEmbeddings } from "../api/commands";
+import { saveEmbedding, getAllEmbeddings, deleteEmbeddingsByProvider } from "../api/commands";
 import type { Prompt } from "../types";
 
 interface EmbeddingState {
@@ -22,13 +22,18 @@ interface EmbeddingState {
 }
 
 /**
- * Manages the embedding index and provides semantic search.
+ * Manages the per-provider embedding index and provides semantic search.
  *
- * Phase 5 additions:
- * - `restoreIndex`: loads persisted embeddings from SQLite on startup so the
- *   index survives app restarts without a full re-embed.
- * - `indexPrompts` / `indexSinglePrompt` now call `saveEmbedding` after each
- *   successful embed so vectors are immediately persisted to SQLite.
+ * Option B persistence model:
+ * - Each provider ("local", "gemini", "voyage") stores its own rows in the
+ *   `embeddings` table, keyed by (prompt_id, provider).
+ * - On startup (or provider switch), `restoreIndex` loads only the rows for
+ *   the active provider, so the in-memory index is always dimensionally
+ *   consistent.
+ * - `indexPrompts` / `indexSinglePrompt` persist each new vector to SQLite
+ *   immediately, overwriting the previous row for that (prompt, provider) pair.
+ * - `rebuildIndex` calls `deleteEmbeddingsByProvider` before re-indexing so
+ *   stale vectors are cleanly replaced rather than accumulated.
  */
 export function useEmbeddings() {
   const [state, setState] = useState<EmbeddingState>({
@@ -58,8 +63,9 @@ export function useEmbeddings() {
 
   const setProvider = useCallback((provider: EmbeddingProvider) => {
     setState((s) => ({ ...s, provider, lastError: null, restoreAttempted: false }));
-    // Clear in-memory index when switching providers (different dimensions).
-    // restoreIndex will reload the matching stored embeddings if they exist.
+    // Clear in-memory index when switching providers.
+    // restoreIndex will reload the matching stored embeddings if they exist,
+    // since Option B keeps independent rows per provider in SQLite.
     indexRef.current.clear();
   }, []);
 
@@ -76,26 +82,29 @@ export function useEmbeddings() {
     []
   );
 
-  // ── Index Restoration (startup) ────────────────────────────────
+  // ── Index Restoration (startup / provider switch) ──────────────
 
   /**
-   * Restore the in-memory index from SQLite.
+   * Restore the in-memory index from SQLite for the currently active provider.
    *
-   * Call this once after prompts have loaded (or after switching providers).
-   * Filters stored embeddings to the current provider's model so vectors from
-   * a different model/dimension are never mixed into the index.
+   * Call this once after prompts have loaded, and again whenever the user
+   * switches providers (setProvider already clears the in-memory index; this
+   * re-populates it from the stored rows for the new provider).
+   *
+   * Filters by provider name — not model — so the correct Option B rows are
+   * always fetched regardless of future model upgrades within a provider.
    *
    * Returns the number of embeddings successfully restored.
    * Silently no-ops in browser mode (when Tauri isn't available).
    */
   const restoreIndex = useCallback(
     async (): Promise<number> => {
-      // Mark restore as attempted regardless of outcome
       setState((s) => ({ ...s, restoreAttempted: true }));
 
       try {
-        const providerInfo = getProviderInfo(state.provider);
-        const stored = await getAllEmbeddings(providerInfo.model);
+        // Option B: filter by provider, not model.
+        // This loads only the rows that match the currently selected backend.
+        const stored = await getAllEmbeddings(state.provider);
 
         let count = 0;
         for (const entry of stored) {
@@ -172,6 +181,29 @@ export function useEmbeddings() {
     [getConfig]
   );
 
+  /**
+   * Rebuild the index for the active provider from scratch.
+   *
+   * Unlike `indexPrompts` (which upserts incrementally), this first wipes all
+   * stored vectors for the current provider so there are no orphaned rows from
+   * deleted prompts, then re-embeds every prompt.
+   *
+   * Rows for other providers are not affected (Option B guarantee).
+   */
+  const rebuildIndex = useCallback(
+    async (prompts: Prompt[]) => {
+      try {
+        await deleteEmbeddingsByProvider(state.provider);
+      } catch (e) {
+        console.warn("Failed to clear old embeddings before rebuild:", e);
+        // Non-fatal — continue with the re-index; upserts will overwrite anyway.
+      }
+      indexRef.current.clear();
+      return indexPrompts(prompts);
+    },
+    [state.provider, indexPrompts]
+  );
+
   // ── Semantic Search ────────────────────────────────────────────
 
   const semanticSearch = useCallback(
@@ -229,7 +261,7 @@ export function useEmbeddings() {
           model: result.model,
         });
 
-        // Persist to SQLite
+        // Persist to SQLite (upserts the (prompt_id, provider) row)
         saveEmbedding(prompt.id, result.vector, result.model, result.provider).catch(
           (e) => console.warn(`Failed to persist embedding for prompt ${prompt.id}:`, e)
         );
@@ -242,7 +274,7 @@ export function useEmbeddings() {
 
   const removeFromIndex = useCallback((promptId: number) => {
     indexRef.current.delete(promptId);
-    // Note: the DB row is cleaned up automatically via ON DELETE CASCADE
+    // The DB row is cleaned up automatically via ON DELETE CASCADE
     // when the prompt is deleted, so no explicit delete call needed here.
   }, []);
 
@@ -259,6 +291,7 @@ export function useEmbeddings() {
     setApiKey,
     restoreIndex,
     indexPrompts,
+    rebuildIndex,
     semanticSearch,
     indexSinglePrompt,
     removeFromIndex,
