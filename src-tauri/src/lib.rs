@@ -3,6 +3,7 @@ mod sync;
 
 use db::{Database, Prompt, PromptVersion, Category, Tag, StoredEmbedding};
 use sync::{DriveSync, SyncConfig, SyncStatus};
+use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{watch, Mutex as TokioMutex};
@@ -413,6 +414,186 @@ async fn set_auto_sync(
     Ok(ok(true))
 }
 
+// ─── Conflict Resolution Commands ────────────────────────────────────────────
+
+/// Describes the sync state when the remote database may be newer than local.
+/// Returned by `get_conflict_info`; `None` means no conflict (or not connected).
+#[derive(Serialize)]
+struct ConflictInfo {
+    /// ISO 8601 timestamp of the remote file's last modification.
+    remote_modified: String,
+    /// ISO 8601 timestamp of the last successful local→remote sync (`last_sync`).
+    /// `None` if this device has never synced.
+    local_last_sync: Option<String>,
+    /// True when `remote_modified > local_last_sync` (remote has changes we haven't seen).
+    remote_is_newer: bool,
+}
+
+/// Check whether the remote database is newer than the local one.
+///
+/// Returns `Some(ConflictInfo)` when:
+///   - The user is connected to Google Drive, AND
+///   - A remote file ID is stored, AND
+///   - The remote `modifiedTime` is newer than `last_sync`
+///
+/// Returns `None` in all other cases (not connected, first sync, network error).
+/// The frontend should call this on startup when Drive is connected.
+#[tauri::command]
+async fn get_conflict_info(state: State<'_, AppState>) -> Result<ApiResult<Option<ConflictInfo>>, ()> {
+    let sync = state.sync.lock().await;
+    let config = sync.get_config();
+
+    // Only relevant when connected and a remote file exists
+    if config.remote_file_id.is_none() {
+        return Ok(ok(None));
+    }
+    if !matches!(config.sync_status, SyncStatus::Connected | SyncStatus::Synced | SyncStatus::Conflict) {
+        return Ok(ok(None));
+    }
+
+    let remote_modified = match sync.check_remote_status().await {
+        Ok(Some(t)) => t,
+        Ok(None) => return Ok(ok(None)),
+        Err(_) => return Ok(ok(None)), // Network error — skip silently on startup
+    };
+
+    let local_last_sync = config.last_sync.clone();
+
+    // Parse both timestamps and compare.  If we've never synced, the remote is
+    // always considered newer (the user should decide whether to pull it down).
+    let remote_is_newer = match &local_last_sync {
+        None => true,
+        Some(last) => {
+            let remote_ts = DateTime::parse_from_rfc3339(&remote_modified).ok();
+            let local_ts  = DateTime::parse_from_rfc3339(last).ok();
+            match (remote_ts, local_ts) {
+                (Some(r), Some(l)) => r > l,
+                _ => false, // Unparseable timestamps — don't force a conflict
+            }
+        }
+    };
+
+    if !remote_is_newer {
+        return Ok(ok(None)); // Local is up-to-date; no conflict
+    }
+
+    Ok(ok(Some(ConflictInfo {
+        remote_modified,
+        local_last_sync,
+        remote_is_newer,
+    })))
+}
+
+/// Resolve a sync conflict.
+///
+/// `strategy` must be one of:
+///   - `"accept_newest"` — download remote and restore it into the live
+///     connection if it is newer; otherwise upload local.  Implements the
+///     last-write-wins policy the user requested.
+///   - `"keep_local"` — unconditionally upload local, overwriting the remote.
+///
+/// After a successful "accept_newest" where the remote was pulled down, the
+/// frontend should reload all data (`getPrompts`, `getCategories`, etc.) because
+/// the in-memory state is now stale.  The return value includes a
+/// `data_replaced` flag that signals when a reload is required.
+#[derive(Serialize)]
+struct ResolveResult {
+    /// True when the local DB was replaced with the remote — frontend must reload.
+    data_replaced: bool,
+}
+
+#[tauri::command]
+async fn resolve_conflict(
+    strategy: String,
+    state: State<'_, AppState>,
+) -> Result<ApiResult<ResolveResult>, ()> {
+    let db_path = state.db_path.clone();
+
+    match strategy.as_str() {
+        "accept_newest" => {
+            // 1. Fetch remote modifiedTime
+            let remote_modified = {
+                let sync = state.sync.lock().await;
+                match sync.check_remote_status().await {
+                    Ok(Some(t)) => t,
+                    Ok(None) => return Ok(err("No remote file found")),
+                    Err(e) => return Ok(err(&e)),
+                }
+            };
+
+            // 2. Compare against local last_sync
+            let local_last_sync = {
+                let sync = state.sync.lock().await;
+                sync.get_config().last_sync.clone()
+            };
+
+            let remote_is_newer = match &local_last_sync {
+                None => true,
+                Some(last) => {
+                    let r = DateTime::parse_from_rfc3339(&remote_modified).ok();
+                    let l = DateTime::parse_from_rfc3339(last).ok();
+                    matches!((r, l), (Some(rv), Some(lv)) if rv > lv)
+                }
+            };
+
+            if remote_is_newer {
+                // 3a. Download remote to a temp file
+                let incoming_path = db_path.replace("prompt_vault.db", "prompt_vault_incoming.db");
+
+                {
+                    let mut sync = state.sync.lock().await;
+                    if let Err(e) = sync.download_db(&incoming_path).await {
+                        return Ok(err(&e));
+                    }
+                }
+
+                // 3b. Restore into the live connection (backup API, no re-open needed)
+                {
+                    let mut db = state.db.lock().unwrap();
+                    if let Err(e) = db.restore_from(&incoming_path) {
+                        // Clean up temp file even on failure
+                        let _ = std::fs::remove_file(&incoming_path);
+                        return Ok(err(&format!("Restore failed: {}", e)));
+                    }
+                }
+
+                // 3c. Clean up temp file
+                let _ = std::fs::remove_file(&incoming_path);
+
+                // 3d. Update last_sync and status so we don't re-trigger the conflict
+                {
+                    let mut sync = state.sync.lock().await;
+                    let mut config = sync.get_config().clone();
+                    config.last_sync = Some(remote_modified);
+                    config.sync_status = SyncStatus::Synced;
+                    if let Err(e) = sync.update_config(config) {
+                        return Ok(err(&e));
+                    }
+                }
+
+                Ok(ok(ResolveResult { data_replaced: true }))
+            } else {
+                // Local is newer — upload it
+                let mut sync = state.sync.lock().await;
+                match sync.upload_db(&db_path).await {
+                    Ok(_) => Ok(ok(ResolveResult { data_replaced: false })),
+                    Err(e) => Ok(err(&e)),
+                }
+            }
+        }
+
+        "keep_local" => {
+            let mut sync = state.sync.lock().await;
+            match sync.upload_db(&db_path).await {
+                Ok(_) => Ok(ok(ResolveResult { data_replaced: false })),
+                Err(e) => Ok(err(&e)),
+            }
+        }
+
+        _ => Ok(err(&format!("Unknown strategy: '{}'. Use 'accept_newest' or 'keep_local'.", strategy))),
+    }
+}
+
 // ─── App Entry ───────────────────────────────────────────────────
 
 pub fn run() {
@@ -466,6 +647,8 @@ pub fn run() {
             sync_to_drive,
             check_sync_status,
             set_auto_sync,
+            get_conflict_info,
+            resolve_conflict,
         ])
         .run(tauri::generate_context!())
         .expect("error while running PromptVault");
