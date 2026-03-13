@@ -187,13 +187,57 @@ export async function checkSyncStatus(): Promise<string | null> {
  *
  * @param enabled       Whether to run the worker.
  * @param intervalMins  Upload interval in minutes (5 / 15 / 30 / 60).
- *
- * The setting is persisted to disk immediately and the live worker is
- * notified via an internal watch channel — no app restart needed.
  */
 export async function setAutoSync(
   enabled: boolean,
   intervalMins: number
 ): Promise<boolean> {
   return call<boolean>("set_auto_sync", { enabled, intervalMins });
+}
+
+// ─── Conflict Resolution ─────────────────────────────────────────
+
+/** Returned by `getConflictInfo` when the remote DB is newer than local. */
+export interface ConflictInfo {
+  /** ISO 8601 timestamp of the remote file's last modification. */
+  remote_modified: string;
+  /** ISO 8601 timestamp of our last sync, or null if we've never synced. */
+  local_last_sync: string | null;
+  /** Always true when this object is returned (remote has unseen changes). */
+  remote_is_newer: boolean;
+}
+
+/** Returned by `resolveConflict`. `data_replaced: true` means the local DB
+ *  was overwritten with the remote and the frontend must reload all data. */
+export interface ResolveResult {
+  data_replaced: boolean;
+}
+
+/**
+ * Check whether the remote database is newer than the local one.
+ *
+ * Returns `ConflictInfo` when a conflict exists, `null` when local is
+ * up-to-date (or the user is not connected to Drive).
+ *
+ * Call this on app startup after confirming the user is connected.
+ */
+export async function getConflictInfo(): Promise<ConflictInfo | null> {
+  return call<ConflictInfo | null>("get_conflict_info");
+}
+
+/**
+ * Resolve a sync conflict.
+ *
+ * @param strategy
+ *   - `"accept_newest"` — last-write-wins: pulls remote if it's newer,
+ *     pushes local if local is newer.
+ *   - `"keep_local"` — unconditionally push local, overwriting the remote.
+ *
+ * When `result.data_replaced` is `true`, the frontend must reload all data
+ * (prompts, categories, tags) because the in-memory state is stale.
+ */
+export async function resolveConflict(
+  strategy: "accept_newest" | "keep_local"
+): Promise<ResolveResult> {
+  return call<ResolveResult>("resolve_conflict", { strategy });
 }
