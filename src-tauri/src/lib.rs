@@ -1,7 +1,7 @@
 mod db;
 mod sync;
 
-use db::{Database, Prompt, PromptVersion, Category, Tag, StoredEmbedding};
+use db::{Database, Prompt, PromptVersion, Category, Tag, StoredEmbedding, SimilarityResult};
 use sync::{DriveSync, SyncConfig, SyncStatus};
 use chrono::DateTime;
 use serde::{Deserialize, Serialize};
@@ -13,49 +13,30 @@ use tauri::State;
 
 // ─── Background Sync Worker ───────────────────────────────────────────────────
 
-/// Controls sent to the background sync worker via a watch channel.
-/// Cloning is cheap — it's just two primitives.
 #[derive(Clone, Debug)]
 struct SyncWorkerCtl {
-    /// Mirror of SyncConfig.auto_sync_enabled — when false the worker idles.
     enabled: bool,
-    /// Mirror of SyncConfig.auto_sync_interval_mins converted to seconds.
     interval_secs: u64,
 }
 
-/// Long-lived background task that periodically uploads the database to Drive.
-///
-/// Design:
-///   - Runs for the entire lifetime of the app (never exits unless the channel
-///     drops, which only happens on app shutdown).
-///   - Uses `tokio::select!` so config changes (via the watch channel) wake it
-///     immediately, even while sleeping between sync cycles.
-///   - Only uploads when both:
-///       1. The worker is `enabled` (user toggled auto-sync on), AND
-///       2. The DriveSync config shows Connected or Synced status.
-///   - Errors are logged to stderr but never crash the worker loop.
 async fn run_sync_worker(
     sync: Arc<TokioMutex<DriveSync>>,
     db_path: String,
     mut ctl_rx: watch::Receiver<SyncWorkerCtl>,
 ) {
     loop {
-        // Take a snapshot of the current control values
         let ctl = ctl_rx.borrow().clone();
 
         if !ctl.enabled || ctl.interval_secs == 0 {
-            // Idle: wait until the config changes before re-evaluating
             if ctl_rx.changed().await.is_err() {
-                break; // Channel dropped → app shutting down
+                break;
             }
             continue;
         }
 
-        // Active: sleep for the configured interval, but wake early on config change
         let sleep_fut = sleep(Duration::from_secs(ctl.interval_secs));
         tokio::select! {
             _ = sleep_fut => {
-                // Interval elapsed — attempt a sync if the conditions are right
                 let mut sync_guard = sync.lock().await;
                 let status = sync_guard.get_config().sync_status.clone();
                 let is_ready = matches!(status, SyncStatus::Connected | SyncStatus::Synced);
@@ -67,8 +48,6 @@ async fn run_sync_worker(
                 }
             }
             _ = ctl_rx.changed() => {
-                // Config changed mid-sleep — loop back to re-read the new values
-                // without syncing (the timer resets)
                 continue;
             }
         }
@@ -77,13 +56,6 @@ async fn run_sync_worker(
 
 // ─── App State ────────────────────────────────────────────────────────────────
 
-/// Shared application state managed by Tauri.
-///
-/// `db`            — std::sync::Mutex  (sync commands only, never held across .await)
-/// `sync`          — Arc<tokio::sync::Mutex> (async, cloneable into spawned tasks)
-/// `db_path`       — captured once at startup; passed to the sync worker
-/// `sync_worker_tx`— watch channel sender for live worker config updates
-/// `db_locked`     — true when DB is encrypted but key not yet applied this session
 struct AppState {
     db: StdMutex<Database>,
     sync: Arc<TokioMutex<DriveSync>>,
@@ -93,10 +65,6 @@ struct AppState {
 }
 
 // ─── Crypto Helpers ───────────────────────────────────────────────────────────
-//
-// Salt file layout:  <app_data>/PromptVault/db.salt  (64 hex chars, no newline)
-// Key derivation:    Argon2id, 64 MB memory, 3 iterations → 32-byte key
-// SQLCipher format:  PRAGMA key = "x'<64-hex-chars>'"
 
 fn salt_path() -> PathBuf {
     let mut p = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
@@ -106,7 +74,6 @@ fn salt_path() -> PathBuf {
     p
 }
 
-/// Returns `true` when a salt file is present, indicating the DB is encrypted.
 fn is_encrypted_on_disk() -> bool {
     salt_path().exists()
 }
@@ -115,8 +82,6 @@ fn bytes_to_hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{:02x}", x)).collect()
 }
 
-/// Derive a 32-byte SQLCipher key from a UTF-8 password and a 32-byte salt.
-/// Uses Argon2id with 64 MB memory and 3 iterations.
 fn derive_key(password: &str, salt: &[u8]) -> Result<String, String> {
     use argon2::{Argon2, Algorithm, Version, Params};
     let params = Params::new(65536, 3, 4, Some(32))
@@ -128,7 +93,6 @@ fn derive_key(password: &str, salt: &[u8]) -> Result<String, String> {
     Ok(bytes_to_hex(&key))
 }
 
-/// Load the persisted salt from disk.
 fn load_salt() -> Result<Vec<u8>, String> {
     let hex = std::fs::read_to_string(salt_path()).map_err(|e| e.to_string())?;
     let clean = hex.trim();
@@ -138,12 +102,49 @@ fn load_salt() -> Result<Vec<u8>, String> {
         .collect()
 }
 
-/// Generate a fresh 32-byte random salt and persist it to disk.
 fn create_salt() -> Result<Vec<u8>, String> {
     let mut salt = vec![0u8; 32];
     getrandom::getrandom(&mut salt).map_err(|e| e.to_string())?;
     std::fs::write(salt_path(), bytes_to_hex(&salt)).map_err(|e| e.to_string())?;
     Ok(salt)
+}
+
+// ─── Shortcuts Config ─────────────────────────────────────────────────────────
+//
+// Persisted at <app_data>/PromptVault/shortcuts.json.
+// All values are lowercase "modifier+key" strings, e.g. "ctrl+k".
+// The frontend parses these strings and compares against KeyboardEvent
+// properties; "ctrl" matches both ctrlKey and metaKey on macOS.
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ShortcutsConfig {
+    pub new_prompt: String,
+    pub command_palette: String,
+    pub brain_selector: String,
+    pub toggle_inspector: String,
+    pub sync_panel: String,
+    pub settings: String,
+}
+
+impl Default for ShortcutsConfig {
+    fn default() -> Self {
+        ShortcutsConfig {
+            new_prompt:       "ctrl+n".to_string(),
+            command_palette:  "ctrl+k".to_string(),
+            brain_selector:   "ctrl+b".to_string(),
+            toggle_inspector: "ctrl+i".to_string(),
+            sync_panel:       "ctrl+shift+s".to_string(),
+            settings:         "ctrl+comma".to_string(),
+        }
+    }
+}
+
+fn shortcuts_path() -> PathBuf {
+    let mut p = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
+    p.push("PromptVault");
+    std::fs::create_dir_all(&p).ok();
+    p.push("shortcuts.json");
+    p
 }
 
 // ─── Response Wrappers ───────────────────────────────────────────
@@ -274,6 +275,33 @@ fn search_prompts(query: String, state: State<AppState>) -> ApiResult<Vec<Prompt
     }
 }
 
+// ─── SQL Similarity Search (Phase 6) ─────────────────────────────────────────
+//
+// Accepts a pre-computed query embedding from the frontend (generated by
+// whichever Brain provider is active) and runs it through the
+// vec_cosine_distance() SQL function registered at startup.
+//
+// This offloads the ranking computation to SQLite, which is more efficient
+// than the previous approach of shipping all stored vectors to JavaScript
+// and computing distances there.
+//
+// The frontend still generates the query embedding (calling the embedding
+// provider API) — only the ranking step moves into SQL.
+
+#[tauri::command]
+fn sql_similarity_search(
+    query_vector: Vec<f32>,
+    provider: String,
+    limit: i64,
+    state: State<AppState>,
+) -> ApiResult<Vec<SimilarityResult>> {
+    let limit = limit.max(1).min(100);
+    match state.db.lock().unwrap().similarity_search(&query_vector, &provider, limit) {
+        Ok(results) => ok(results),
+        Err(e) => err(&e.to_string()),
+    }
+}
+
 // ─── Embedding Commands ──────────────────────────────────────────
 
 #[tauri::command]
@@ -290,10 +318,6 @@ fn save_embedding(
     }
 }
 
-/// Load all stored embeddings for a specific provider.
-///
-/// Pass the provider name ("local", "gemini", or "voyage") to retrieve only
-/// that provider's vectors.  Pass an empty string to retrieve every row.
 #[tauri::command]
 fn get_all_embeddings(provider: String, state: State<AppState>) -> ApiResult<Vec<StoredEmbedding>> {
     let filter = if provider.is_empty() { None } else { Some(provider.as_str()) };
@@ -303,10 +327,6 @@ fn get_all_embeddings(provider: String, state: State<AppState>) -> ApiResult<Vec
     }
 }
 
-/// Delete all stored embeddings for a specific provider.
-///
-/// Called by the BrainSelector "Rebuild Index" button to wipe stale vectors
-/// for the active provider before re-indexing.  Other providers are untouched.
 #[tauri::command]
 fn delete_embeddings_by_provider(provider: String, state: State<AppState>) -> ApiResult<usize> {
     match state.db.lock().unwrap().delete_embeddings_by_provider(&provider) {
@@ -315,26 +335,181 @@ fn delete_embeddings_by_provider(provider: String, state: State<AppState>) -> Ap
     }
 }
 
+// ─── Export Commands ──────────────────────────────────────────────────────────
+//
+// Returns the serialized vault content as a String so the frontend can
+// trigger a file-download without needing tauri-plugin-fs.
+//
+// Formats:
+//   "json"     — structured JSON with full metadata and version history
+//   "markdown" — human-readable Markdown document, one section per prompt
+
+#[derive(Deserialize)]
+struct ExportOptions {
+    /// "json" | "markdown"
+    format: String,
+    /// Specific prompt IDs to export.  null / omitted = export all.
+    ids: Option<Vec<i64>>,
+}
+
+#[tauri::command]
+fn export_prompts(options: ExportOptions, state: State<AppState>) -> ApiResult<String> {
+    let db = state.db.lock().unwrap();
+
+    let all_prompts = match db.get_prompts() {
+        Ok(p) => p,
+        Err(e) => return err(&e.to_string()),
+    };
+
+    let prompts: Vec<Prompt> = if let Some(ids) = &options.ids {
+        all_prompts.into_iter().filter(|p| ids.contains(&p.id)).collect()
+    } else {
+        all_prompts
+    };
+
+    match options.format.as_str() {
+        // ── JSON export ──────────────────────────────────────────
+        "json" => {
+            #[derive(Serialize)]
+            struct ExportVersion {
+                version_number: i32,
+                content: String,
+                created_at: String,
+            }
+
+            #[derive(Serialize)]
+            struct ExportPrompt {
+                id: i64,
+                title: String,
+                content: String,
+                category_id: Option<i64>,
+                tags: Vec<String>,
+                created_at: String,
+                updated_at: String,
+                versions: Vec<ExportVersion>,
+            }
+
+            #[derive(Serialize)]
+            struct ExportPayload {
+                schema_version: u32,
+                exported_at: String,
+                prompt_count: usize,
+                prompts: Vec<ExportPrompt>,
+            }
+
+            let mut export_prompts: Vec<ExportPrompt> = Vec::new();
+            for p in &prompts {
+                let versions = match db.get_prompt_versions(p.id) {
+                    Ok(v) => v,
+                    Err(_) => vec![],
+                };
+                export_prompts.push(ExportPrompt {
+                    id: p.id,
+                    title: p.title.clone(),
+                    content: p.content.clone(),
+                    category_id: p.category_id,
+                    tags: p.tags.clone(),
+                    created_at: p.created_at.clone(),
+                    updated_at: p.updated_at.clone(),
+                    versions: versions.into_iter().map(|v| ExportVersion {
+                        version_number: v.version_number,
+                        content: v.content_text,
+                        created_at: v.created_at,
+                    }).collect(),
+                });
+            }
+
+            let payload = ExportPayload {
+                schema_version: 1,
+                exported_at: chrono::Utc::now().to_rfc3339(),
+                prompt_count: export_prompts.len(),
+                prompts: export_prompts,
+            };
+
+            match serde_json::to_string_pretty(&payload) {
+                Ok(json) => ok(json),
+                Err(e) => err(&e.to_string()),
+            }
+        }
+
+        // ── Markdown export ──────────────────────────────────────
+        "markdown" => {
+            let mut out = String::new();
+            out.push_str("# PromptVault Export\n\n");
+            out.push_str(&format!(
+                "> **Exported:** {}  \n> **Prompts:** {}\n\n",
+                chrono::Utc::now().format("%Y-%m-%d %H:%M UTC"),
+                prompts.len()
+            ));
+
+            for p in &prompts {
+                out.push_str("---\n\n");
+                out.push_str(&format!("## {}\n\n", p.title));
+
+                // Frontmatter-style metadata block
+                let date_created = p.created_at.split('T').next().unwrap_or(&p.created_at);
+                let date_updated = p.updated_at.split('T').next().unwrap_or(&p.updated_at);
+                out.push_str(&format!(
+                    "> **Created:** {}  \n> **Updated:** {}  \n",
+                    date_created, date_updated
+                ));
+                if !p.tags.is_empty() {
+                    let tags = p.tags.iter().map(|t| format!("`#{}`", t)).collect::<Vec<_>>().join(" ");
+                    out.push_str(&format!("> **Tags:** {}  \n", tags));
+                }
+                out.push('\n');
+                out.push_str(&p.content);
+                out.push_str("\n\n");
+            }
+
+            ok(out)
+        }
+
+        _ => err(&format!(
+            "Unknown export format '{}'. Valid options: 'json', 'markdown'.",
+            options.format
+        )),
+    }
+}
+
+// ─── Keyboard Shortcuts Commands ─────────────────────────────────────────────
+
+#[tauri::command]
+fn get_shortcuts() -> ApiResult<ShortcutsConfig> {
+    let path = shortcuts_path();
+    if path.exists() {
+        match std::fs::read_to_string(&path) {
+            Ok(data) => match serde_json::from_str::<ShortcutsConfig>(&data) {
+                Ok(cfg) => ok(cfg),
+                Err(_)  => ok(ShortcutsConfig::default()),
+            },
+            Err(_) => ok(ShortcutsConfig::default()),
+        }
+    } else {
+        ok(ShortcutsConfig::default())
+    }
+}
+
+#[tauri::command]
+fn save_shortcuts(config: ShortcutsConfig) -> ApiResult<bool> {
+    let path = shortcuts_path();
+    match serde_json::to_string_pretty(&config) {
+        Ok(data) => match std::fs::write(&path, data) {
+            Ok(_)  => ok(true),
+            Err(e) => err(&e.to_string()),
+        },
+        Err(e) => err(&e.to_string()),
+    }
+}
+
 // ─── Sync Commands ───────────────────────────────────────────────
 
-/// Start the full Google Drive OAuth 2.0 flow.
-///
-/// 1. Saves the provided credentials to disk.
-/// 2. Builds and returns the Google authorization URL (so the frontend can open
-///    it in the system browser).
-/// 3. Spawns a background task that binds localhost:8741, waits for the Google
-///    redirect (up to 3 minutes), extracts the code, exchanges it for tokens,
-///    and persists the Connected state — all without any further frontend input.
-///
-/// The frontend should poll `get_sync_config` after calling this command until
-/// `sync_status` changes from Disconnected to Connected (or Error).
 #[tauri::command]
 async fn start_oauth_flow(
     client_id: String,
     client_secret: String,
     state: State<'_, AppState>,
 ) -> Result<ApiResult<String>, ()> {
-    // Save credentials and build auth URL
     let auth_url = {
         let mut sync = state.sync.lock().await;
         let mut config = sync.get_config().clone();
@@ -349,7 +524,6 @@ async fn start_oauth_flow(
         }
     };
 
-    // Clone the Arc so the spawned task can access DriveSync independently
     let sync_arc = Arc::clone(&state.sync);
 
     tokio::spawn(async move {
@@ -428,27 +602,14 @@ async fn check_sync_status(state: State<'_, AppState>) -> Result<ApiResult<Optio
     }
 }
 
-/// Enable or disable the periodic background sync worker.
-///
-/// This command:
-///   1. Updates `auto_sync_enabled` and `auto_sync_interval_mins` in the
-///      persisted SyncConfig (so the setting survives restarts).
-///   2. Sends the updated control values through the watch channel so the
-///      already-running worker reacts immediately — no restart required.
-///
-/// `interval_mins` must be one of [5, 15, 30, 60].  Values outside this
-/// range are clamped to 5 on the worker side (the frontend enforces the
-/// allowed values, but we defensively clamp here as well).
 #[tauri::command]
 async fn set_auto_sync(
     enabled: bool,
     interval_mins: u32,
     state: State<'_, AppState>,
 ) -> Result<ApiResult<bool>, ()> {
-    // Clamp interval to a sane range
     let interval_mins = interval_mins.max(1).min(60);
 
-    // Persist the setting
     {
         let mut sync = state.sync.lock().await;
         let mut config = sync.get_config().clone();
@@ -459,9 +620,6 @@ async fn set_auto_sync(
         }
     }
 
-    // Signal the live worker (non-blocking — watch::Sender::send always succeeds
-    // as long as at least one Receiver exists, which the worker holds for the
-    // app lifetime)
     let _ = state.sync_worker_tx.send(SyncWorkerCtl {
         enabled,
         interval_secs: (interval_mins as u64) * 60,
@@ -470,37 +628,129 @@ async fn set_auto_sync(
     Ok(ok(true))
 }
 
+// ─── Team Sync Commands ───────────────────────────────────────────────────────
+//
+// Team sync allows multiple users (or multiple devices of the same user)
+// to share a prompt vault via a regular Drive file rather than the per-user
+// appDataFolder.  This requires the drive.file OAuth scope; users are
+// prompted to re-authenticate when switching to team mode.
+
+/// Start the OAuth flow for team mode (drive.file scope).
+///
+/// After the user consents, PromptVault can create/update a Drive file that
+/// can be shared with teammates.  The caller should poll `get_sync_config`
+/// until sync_status changes.
+#[tauri::command]
+async fn start_team_oauth_flow(
+    client_id: String,
+    client_secret: String,
+    state: State<'_, AppState>,
+) -> Result<ApiResult<String>, ()> {
+    let auth_url = {
+        let mut sync = state.sync.lock().await;
+        let mut config = sync.get_config().clone();
+        config.client_id = client_id;
+        config.client_secret = client_secret;
+        config.team_mode = true;
+        if let Err(e) = sync.update_config(config) {
+            return Ok(err(&e));
+        }
+        match sync.get_team_auth_url() {
+            Ok(url) => url,
+            Err(e) => return Ok(err(&e)),
+        }
+    };
+
+    let sync_arc = Arc::clone(&state.sync);
+
+    tokio::spawn(async move {
+        match sync::await_oauth_callback().await {
+            Ok(code) => {
+                let mut sync = sync_arc.lock().await;
+                if let Err(e) = sync.exchange_code(&code).await {
+                    let mut config = sync.get_config().clone();
+                    config.sync_status = SyncStatus::Error(e.clone());
+                    sync.update_config(config).ok();
+                }
+            }
+            Err(e) => {
+                let mut sync = sync_arc.lock().await;
+                let mut config = sync.get_config().clone();
+                config.sync_status = SyncStatus::Error(e.clone());
+                sync.update_config(config).ok();
+            }
+        }
+    });
+
+    Ok(ok(auth_url))
+}
+
+/// Connect to an existing shared vault using a team file ID provided by a
+/// teammate.  Immediately downloads the remote DB and restores it locally.
+#[tauri::command]
+async fn connect_team_vault(
+    team_file_id: String,
+    state: State<'_, AppState>,
+) -> Result<ApiResult<bool>, ()> {
+    let db_path = state.db_path.clone();
+
+    // Save the team file ID
+    {
+        let mut sync = state.sync.lock().await;
+        let mut config = sync.get_config().clone();
+        config.team_file_id = Some(team_file_id);
+        config.team_mode = true;
+        if let Err(e) = sync.update_config(config) {
+            return Ok(err(&e));
+        }
+    }
+
+    // Download the remote vault into a temp file and restore into live DB
+    let incoming = db_path.replace("prompt_vault.db", "prompt_vault_team_incoming.db");
+    {
+        let mut sync = state.sync.lock().await;
+        if let Err(e) = sync.download_db(&incoming).await {
+            return Ok(err(&format!("Download failed: {}", e)));
+        }
+    }
+
+    {
+        let mut db = state.db.lock().unwrap();
+        if let Err(e) = db.restore_from(&incoming) {
+            let _ = std::fs::remove_file(&incoming);
+            return Ok(err(&format!("Restore failed: {}", e)));
+        }
+    }
+
+    let _ = std::fs::remove_file(&incoming);
+
+    // Mark as synced
+    {
+        let mut sync = state.sync.lock().await;
+        let mut config = sync.get_config().clone();
+        config.sync_status = SyncStatus::Synced;
+        config.last_sync = Some(chrono::Utc::now().to_rfc3339());
+        sync.update_config(config).ok();
+    }
+
+    Ok(ok(true))
+}
+
 // ─── Conflict Resolution Commands ────────────────────────────────────────────
 
-/// Describes the sync state when the remote database may be newer than local.
-/// Returned by `get_conflict_info`; `None` means no conflict (or not connected).
 #[derive(Serialize)]
 struct ConflictInfo {
-    /// ISO 8601 timestamp of the remote file's last modification.
     remote_modified: String,
-    /// ISO 8601 timestamp of the last successful local→remote sync (`last_sync`).
-    /// `None` if this device has never synced.
     local_last_sync: Option<String>,
-    /// True when `remote_modified > local_last_sync` (remote has changes we haven't seen).
     remote_is_newer: bool,
 }
 
-/// Check whether the remote database is newer than the local one.
-///
-/// Returns `Some(ConflictInfo)` when:
-///   - The user is connected to Google Drive, AND
-///   - A remote file ID is stored, AND
-///   - The remote `modifiedTime` is newer than `last_sync`
-///
-/// Returns `None` in all other cases (not connected, first sync, network error).
-/// The frontend should call this on startup when Drive is connected.
 #[tauri::command]
 async fn get_conflict_info(state: State<'_, AppState>) -> Result<ApiResult<Option<ConflictInfo>>, ()> {
     let sync = state.sync.lock().await;
     let config = sync.get_config();
 
-    // Only relevant when connected and a remote file exists
-    if config.remote_file_id.is_none() {
+    if config.remote_file_id.is_none() && config.team_file_id.is_none() {
         return Ok(ok(None));
     }
     if !matches!(config.sync_status, SyncStatus::Connected | SyncStatus::Synced | SyncStatus::Conflict) {
@@ -510,13 +760,11 @@ async fn get_conflict_info(state: State<'_, AppState>) -> Result<ApiResult<Optio
     let remote_modified = match sync.check_remote_status().await {
         Ok(Some(t)) => t,
         Ok(None) => return Ok(ok(None)),
-        Err(_) => return Ok(ok(None)), // Network error — skip silently on startup
+        Err(_) => return Ok(ok(None)),
     };
 
     let local_last_sync = config.last_sync.clone();
 
-    // Parse both timestamps and compare.  If we've never synced, the remote is
-    // always considered newer (the user should decide whether to pull it down).
     let remote_is_newer = match &local_last_sync {
         None => true,
         Some(last) => {
@@ -524,13 +772,13 @@ async fn get_conflict_info(state: State<'_, AppState>) -> Result<ApiResult<Optio
             let local_ts  = DateTime::parse_from_rfc3339(last).ok();
             match (remote_ts, local_ts) {
                 (Some(r), Some(l)) => r > l,
-                _ => false, // Unparseable timestamps — don't force a conflict
+                _ => false,
             }
         }
     };
 
     if !remote_is_newer {
-        return Ok(ok(None)); // Local is up-to-date; no conflict
+        return Ok(ok(None));
     }
 
     Ok(ok(Some(ConflictInfo {
@@ -540,21 +788,8 @@ async fn get_conflict_info(state: State<'_, AppState>) -> Result<ApiResult<Optio
     })))
 }
 
-/// Resolve a sync conflict.
-///
-/// `strategy` must be one of:
-///   - `"accept_newest"` — download remote and restore it into the live
-///     connection if it is newer; otherwise upload local.  Implements the
-///     last-write-wins policy the user requested.
-///   - `"keep_local"` — unconditionally upload local, overwriting the remote.
-///
-/// After a successful "accept_newest" where the remote was pulled down, the
-/// frontend should reload all data (`getPrompts`, `getCategories`, etc.) because
-/// the in-memory state is now stale.  The return value includes a
-/// `data_replaced` flag that signals when a reload is required.
 #[derive(Serialize)]
 struct ResolveResult {
-    /// True when the local DB was replaced with the remote — frontend must reload.
     data_replaced: bool,
 }
 
@@ -567,7 +802,6 @@ async fn resolve_conflict(
 
     match strategy.as_str() {
         "accept_newest" => {
-            // 1. Fetch remote modifiedTime
             let remote_modified = {
                 let sync = state.sync.lock().await;
                 match sync.check_remote_status().await {
@@ -577,7 +811,6 @@ async fn resolve_conflict(
                 }
             };
 
-            // 2. Compare against local last_sync
             let local_last_sync = {
                 let sync = state.sync.lock().await;
                 sync.get_config().last_sync.clone()
@@ -593,7 +826,6 @@ async fn resolve_conflict(
             };
 
             if remote_is_newer {
-                // 3a. Download remote to a temp file
                 let incoming_path = db_path.replace("prompt_vault.db", "prompt_vault_incoming.db");
 
                 {
@@ -603,20 +835,16 @@ async fn resolve_conflict(
                     }
                 }
 
-                // 3b. Restore into the live connection (backup API, no re-open needed)
                 {
                     let mut db = state.db.lock().unwrap();
                     if let Err(e) = db.restore_from(&incoming_path) {
-                        // Clean up temp file even on failure
                         let _ = std::fs::remove_file(&incoming_path);
                         return Ok(err(&format!("Restore failed: {}", e)));
                     }
                 }
 
-                // 3c. Clean up temp file
                 let _ = std::fs::remove_file(&incoming_path);
 
-                // 3d. Update last_sync and status so we don't re-trigger the conflict
                 {
                     let mut sync = state.sync.lock().await;
                     let mut config = sync.get_config().clone();
@@ -629,7 +857,6 @@ async fn resolve_conflict(
 
                 Ok(ok(ResolveResult { data_replaced: true }))
             } else {
-                // Local is newer — upload it
                 let mut sync = state.sync.lock().await;
                 match sync.upload_db(&db_path).await {
                     Ok(_) => Ok(ok(ResolveResult { data_replaced: false })),
@@ -652,17 +879,9 @@ async fn resolve_conflict(
 
 // ─── Encryption Commands ─────────────────────────────────────────────────────
 
-/// Returns whether the database file is currently encrypted (salt file present)
-/// and whether the key has been applied this session.
-///
-/// The frontend calls this once on startup to decide whether to show the
-/// unlock dialog.
 #[derive(Serialize)]
 struct DbLockStatus {
-    /// True when the DB is encrypted (salt file exists on disk).
     encrypted: bool,
-    /// True when the encryption key has been applied this session.
-    /// Always `true` when `encrypted` is `false`.
     unlocked: bool,
 }
 
@@ -673,16 +892,8 @@ fn get_db_lock_status(state: State<AppState>) -> ApiResult<DbLockStatus> {
     ok(DbLockStatus { encrypted, unlocked })
 }
 
-/// Unlock an encrypted database using the master password.
-///
-/// Derives the SQLCipher key from the stored salt + password (Argon2id),
-/// applies it to the live connection, and verifies by reading `sqlite_master`.
-/// On success, clears the `db_locked` flag so normal commands can proceed.
-///
-/// Returns an error (without changing state) if the password is wrong.
 #[tauri::command]
 fn unlock_database(password: String, state: State<AppState>) -> ApiResult<bool> {
-    // Load salt — if absent the DB isn't encrypted, nothing to unlock.
     let salt = match load_salt() {
         Ok(s) => s,
         Err(_) => {
@@ -706,16 +917,6 @@ fn unlock_database(password: String, state: State<AppState>) -> ApiResult<bool> 
     }
 }
 
-/// Set, change, or remove the master password.
-///
-/// | `current`    | `new_password` | Effect                                         |
-/// |--------------|----------------|------------------------------------------------|
-/// | `None`       | `Some(pw)`     | Enable encryption on a plaintext DB            |
-/// | `Some(old)`  | `Some(new)`    | Change the password (re-key)                   |
-/// | `Some(old)`  | `None`         | Remove encryption (decrypt to plaintext)        |
-///
-/// If the DB is currently encrypted, `current` must be provided and correct.
-/// The caller should ensure the DB is **unlocked** before invoking this command.
 #[tauri::command]
 fn set_db_password(
     current: Option<String>,
@@ -724,7 +925,6 @@ fn set_db_password(
 ) -> ApiResult<bool> {
     let db = state.db.lock().unwrap();
 
-    // ── Verify + apply existing key (if encrypted) ───────────────
     if is_encrypted_on_disk() {
         let old_pw = match &current {
             Some(pw) => pw,
@@ -738,14 +938,13 @@ fn set_db_password(
             Ok(k) => k,
             Err(e) => return err(&e),
         };
-        if let Err(_) = db.apply_key(&old_key) {
+        if db.apply_key(&old_key).is_err() {
             return err("Incorrect current password");
         }
     }
 
     match &new_password {
         Some(new_pw) => {
-            // Generate fresh salt, derive new key, re-key the DB.
             let new_salt = match create_salt() {
                 Ok(s) => s,
                 Err(e) => return err(&e),
@@ -753,7 +952,6 @@ fn set_db_password(
             let new_key = match derive_key(new_pw, &new_salt) {
                 Ok(k) => k,
                 Err(e) => {
-                    // Salt was already written; clean up on failure
                     let _ = std::fs::remove_file(salt_path());
                     return err(&e);
                 }
@@ -762,12 +960,10 @@ fn set_db_password(
                 let _ = std::fs::remove_file(salt_path());
                 return err(&e.to_string());
             }
-            // DB is now unlocked with the new key
             state.db_locked.store(false, Ordering::SeqCst);
             ok(true)
         }
         None => {
-            // Remove encryption
             if let Err(e) = db.rekey(None) {
                 return err(&e.to_string());
             }
@@ -785,7 +981,6 @@ pub fn run() {
     let db_path = db.get_db_path();
     let sync = DriveSync::new();
 
-    // Read the saved auto-sync settings so the worker starts in the right state
     let saved_cfg = sync.get_config().clone();
     let initial_ctl = SyncWorkerCtl {
         enabled: saved_cfg.auto_sync_enabled,
@@ -795,12 +990,8 @@ pub fn run() {
     let (worker_tx, worker_rx) = watch::channel(initial_ctl);
     let sync_arc = Arc::new(TokioMutex::new(sync));
 
-    // The DB starts locked whenever a salt file is present (encryption enabled).
-    // The frontend will show the unlock dialog and call `unlock_database` before
-    // any data commands.
     let db_locked = Arc::new(AtomicBool::new(is_encrypted_on_disk()));
 
-    // Spawn the background sync worker — it runs for the entire app lifetime.
     let worker_sync = Arc::clone(&sync_arc);
     let worker_db_path = db_path.clone();
     tokio::spawn(run_sync_worker(worker_sync, worker_db_path, worker_rx));
@@ -815,19 +1006,32 @@ pub fn run() {
             db_locked,
         })
         .invoke_handler(tauri::generate_handler![
+            // Categories
             get_categories,
             create_category,
+            // Prompts
             get_prompts,
             get_prompt_by_id,
             create_prompt,
             update_prompt,
             delete_prompt,
+            // Versions
             get_prompt_versions,
+            // Tags
             get_all_tags,
+            // Search
             search_prompts,
+            sql_similarity_search,
+            // Embeddings
             save_embedding,
             get_all_embeddings,
             delete_embeddings_by_provider,
+            // Export
+            export_prompts,
+            // Shortcuts
+            get_shortcuts,
+            save_shortcuts,
+            // Sync (personal)
             start_oauth_flow,
             get_sync_config,
             update_sync_config,
@@ -836,8 +1040,13 @@ pub fn run() {
             sync_to_drive,
             check_sync_status,
             set_auto_sync,
+            // Sync (team)
+            start_team_oauth_flow,
+            connect_team_vault,
+            // Conflict
             get_conflict_info,
             resolve_conflict,
+            // Encryption
             get_db_lock_status,
             unlock_database,
             set_db_password,
