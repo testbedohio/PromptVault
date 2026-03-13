@@ -2,12 +2,16 @@ import { useState, useCallback, useRef } from "react";
 import {
   embed,
   cosineSimilarity,
-  getProviderInfo,
   type EmbeddingConfig,
   type EmbeddingProvider,
   type EmbeddingResult,
 } from "./service";
-import { saveEmbedding, getAllEmbeddings, deleteEmbeddingsByProvider } from "../api/commands";
+import {
+  saveEmbedding,
+  getAllEmbeddings,
+  deleteEmbeddingsByProvider,
+  vectorSearch,
+} from "../api/commands";
 import type { Prompt } from "../types";
 
 interface EmbeddingState {
@@ -19,10 +23,18 @@ interface EmbeddingState {
   lastError: string | null;
   /** True once restoreIndex has been called (even if it found nothing). */
   restoreAttempted: boolean;
+  /** True when sqlite-vec SQL search is available (set after first successful call). */
+  sqlSearchAvailable: boolean;
 }
 
 /**
  * Manages the per-provider embedding index and provides semantic search.
+ *
+ * Search strategy (Phase 6):
+ * - Primary: SQL-level cosine similarity via `vector_search` (sqlite-vec).
+ *   Runs entirely in Rust/SQLite — no JS round-trip for scoring.
+ * - Fallback: JS-side cosine similarity over the in-memory index.
+ *   Used in browser mode or if sqlite-vec failed to load.
  *
  * Option B persistence model:
  * - Each provider ("local", "gemini", "voyage") stores its own rows in the
@@ -30,10 +42,6 @@ interface EmbeddingState {
  * - On startup (or provider switch), `restoreIndex` loads only the rows for
  *   the active provider, so the in-memory index is always dimensionally
  *   consistent.
- * - `indexPrompts` / `indexSinglePrompt` persist each new vector to SQLite
- *   immediately, overwriting the previous row for that (prompt, provider) pair.
- * - `rebuildIndex` calls `deleteEmbeddingsByProvider` before re-indexing so
- *   stale vectors are cleanly replaced rather than accumulated.
  */
 export function useEmbeddings() {
   const [state, setState] = useState<EmbeddingState>({
@@ -44,6 +52,7 @@ export function useEmbeddings() {
     indexProgress: null,
     lastError: null,
     restoreAttempted: false,
+    sqlSearchAvailable: false,
   });
 
   // In-memory embedding index: promptId → { vector, model }
@@ -62,10 +71,13 @@ export function useEmbeddings() {
   // ── Provider Settings ──────────────────────────────────────────
 
   const setProvider = useCallback((provider: EmbeddingProvider) => {
-    setState((s) => ({ ...s, provider, lastError: null, restoreAttempted: false }));
-    // Clear in-memory index when switching providers.
-    // restoreIndex will reload the matching stored embeddings if they exist,
-    // since Option B keeps independent rows per provider in SQLite.
+    setState((s) => ({
+      ...s,
+      provider,
+      lastError: null,
+      restoreAttempted: false,
+      sqlSearchAvailable: false,
+    }));
     indexRef.current.clear();
   }, []);
 
@@ -84,26 +96,11 @@ export function useEmbeddings() {
 
   // ── Index Restoration (startup / provider switch) ──────────────
 
-  /**
-   * Restore the in-memory index from SQLite for the currently active provider.
-   *
-   * Call this once after prompts have loaded, and again whenever the user
-   * switches providers (setProvider already clears the in-memory index; this
-   * re-populates it from the stored rows for the new provider).
-   *
-   * Filters by provider name — not model — so the correct Option B rows are
-   * always fetched regardless of future model upgrades within a provider.
-   *
-   * Returns the number of embeddings successfully restored.
-   * Silently no-ops in browser mode (when Tauri isn't available).
-   */
   const restoreIndex = useCallback(
     async (): Promise<number> => {
       setState((s) => ({ ...s, restoreAttempted: true }));
 
       try {
-        // Option B: filter by provider, not model.
-        // This loads only the rows that match the currently selected backend.
         const stored = await getAllEmbeddings(state.provider);
 
         let count = 0;
@@ -119,8 +116,6 @@ export function useEmbeddings() {
 
         return count;
       } catch {
-        // In browser mode (no Tauri), getAllEmbeddings will throw — that's fine.
-        // The index simply starts empty and the user can build it via BrainSelector.
         return 0;
       }
     },
@@ -146,13 +141,11 @@ export function useEmbeddings() {
           const text = `${prompt.title}\n${prompt.content}`;
           const result: EmbeddingResult = await embed(text, config);
 
-          // Update in-memory index
           indexRef.current.set(prompt.id, {
             vector: result.vector,
             model: result.model,
           });
 
-          // Persist to SQLite (fire-and-forget; don't block indexing on DB write)
           saveEmbedding(prompt.id, result.vector, result.model, result.provider).catch(
             (e) => console.warn(`Failed to persist embedding for prompt ${prompt.id}:`, e)
           );
@@ -184,11 +177,8 @@ export function useEmbeddings() {
   /**
    * Rebuild the index for the active provider from scratch.
    *
-   * Unlike `indexPrompts` (which upserts incrementally), this first wipes all
-   * stored vectors for the current provider so there are no orphaned rows from
-   * deleted prompts, then re-embeds every prompt.
-   *
-   * Rows for other providers are not affected (Option B guarantee).
+   * Wipes all stored vectors for the current provider, then re-embeds every
+   * prompt.  Rows for other providers are not affected (Option B guarantee).
    */
   const rebuildIndex = useCallback(
     async (prompts: Prompt[]) => {
@@ -196,9 +186,9 @@ export function useEmbeddings() {
         await deleteEmbeddingsByProvider(state.provider);
       } catch (e) {
         console.warn("Failed to clear old embeddings before rebuild:", e);
-        // Non-fatal — continue with the re-index; upserts will overwrite anyway.
       }
       indexRef.current.clear();
+      setState((s) => ({ ...s, sqlSearchAvailable: false }));
       return indexPrompts(prompts);
     },
     [state.provider, indexPrompts]
@@ -206,35 +196,71 @@ export function useEmbeddings() {
 
   // ── Semantic Search ────────────────────────────────────────────
 
+  /**
+   * Search for semantically similar prompts.
+   *
+   * Phase 6 upgrade: tries SQL-level vector search first (sqlite-vec).
+   * If the extension isn't loaded or returns an error, falls back to the
+   * in-memory JS cosine similarity that was used in earlier phases.
+   */
   const semanticSearch = useCallback(
     async (
       query: string,
       prompts: Prompt[],
       topK: number = 10
     ): Promise<{ prompt: Prompt; score: number }[]> => {
-      if (indexRef.current.size === 0) {
+      const config = getConfig();
+      const indexSize = indexRef.current.size;
+
+      // Need at least some embeddings stored to search
+      if (indexSize === 0) {
         return [];
       }
-
-      const config = getConfig();
 
       try {
         const queryResult = await embed(query, config);
 
+        // ── Primary: SQL vector search ─────────────────────────
+        if (state.sqlSearchAvailable || indexSize > 0) {
+          try {
+            const sqlResults = await vectorSearch(
+              queryResult.vector,
+              state.provider,
+              topK
+            );
+
+            if (sqlResults.length > 0) {
+              // Mark SQL search as confirmed available
+              setState((s) => ({ ...s, sqlSearchAvailable: true }));
+
+              // Map prompt_ids back to Prompt objects
+              const promptMap = new Map(prompts.map((p) => [p.id, p]));
+              return sqlResults
+                .map((r) => ({
+                  prompt: promptMap.get(r.prompt_id)!,
+                  score: r.similarity,
+                }))
+                .filter((r) => r.prompt != null);
+            }
+          } catch (sqlErr) {
+            // sqlite-vec not available — fall through to JS fallback
+            console.debug("[PromptVault] SQL vector search unavailable, using JS fallback:", sqlErr);
+            setState((s) => ({ ...s, sqlSearchAvailable: false }));
+          }
+        }
+
+        // ── Fallback: JS-side cosine similarity ────────────────
         const scored: { prompt: Prompt; score: number }[] = [];
 
         for (const prompt of prompts) {
           const entry = indexRef.current.get(prompt.id);
           if (!entry) continue;
-
-          // Only compare vectors of the same dimensionality
           if (entry.vector.length !== queryResult.vector.length) continue;
 
           const score = cosineSimilarity(queryResult.vector, entry.vector);
           scored.push({ prompt, score });
         }
 
-        // Sort by similarity descending
         scored.sort((a, b) => b.score - a.score);
         return scored.slice(0, topK);
       } catch (e) {
@@ -243,7 +269,7 @@ export function useEmbeddings() {
         return [];
       }
     },
-    [getConfig]
+    [getConfig, state.provider, state.sqlSearchAvailable]
   );
 
   // ── Index a single prompt (incremental updates) ────────────────
@@ -255,13 +281,11 @@ export function useEmbeddings() {
         const text = `${prompt.title}\n${prompt.content}`;
         const result = await embed(text, config);
 
-        // Update in-memory index
         indexRef.current.set(prompt.id, {
           vector: result.vector,
           model: result.model,
         });
 
-        // Persist to SQLite (upserts the (prompt_id, provider) row)
         saveEmbedding(prompt.id, result.vector, result.model, result.provider).catch(
           (e) => console.warn(`Failed to persist embedding for prompt ${prompt.id}:`, e)
         );
@@ -274,8 +298,7 @@ export function useEmbeddings() {
 
   const removeFromIndex = useCallback((promptId: number) => {
     indexRef.current.delete(promptId);
-    // The DB row is cleaned up automatically via ON DELETE CASCADE
-    // when the prompt is deleted, so no explicit delete call needed here.
+    // DB row cleaned up automatically via ON DELETE CASCADE
   }, []);
 
   return {
@@ -286,6 +309,7 @@ export function useEmbeddings() {
     indexProgress: state.indexProgress,
     lastError: state.lastError,
     restoreAttempted: state.restoreAttempted,
+    sqlSearchAvailable: state.sqlSearchAvailable,
     indexSize: indexRef.current.size,
     setProvider,
     setApiKey,
