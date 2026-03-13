@@ -170,10 +170,11 @@ impl Database {
             );
 
             -- FTS5 full-text search index
+            -- Note: no content='' — this is a regular (not contentless) FTS5 table
+            -- so DELETE and INSERT both work correctly.
             CREATE VIRTUAL TABLE IF NOT EXISTS prompts_fts USING fts5(
                 title,
                 content,
-                content='',
                 tokenize='porter unicode61'
             );
 
@@ -205,6 +206,7 @@ impl Database {
         // (prompt_id alone) to the new composite PK (prompt_id, provider).
         // This is a no-op on fresh installs.
         self.migrate_embeddings_to_composite_pk()?;
+        self.migrate_fts_contentless()?;
 
         Ok(())
     }
@@ -250,6 +252,50 @@ impl Database {
             "
         )?;
 
+        Ok(())
+    }
+
+    /// Detect and drop a contentless FTS5 table (created with `content=''`),
+    /// then recreate it as a regular FTS5 table.
+    ///
+    /// A contentless FTS5 table does not support DELETE or INSERT with existing
+    /// rowids, which breaks `update_prompt` and `delete_prompt`. This migration
+    /// is a no-op on fresh installs or databases already using a regular table.
+    fn migrate_fts_contentless(&self) -> Result<()> {
+        // The fts5vocab / fts config stores 'content' key when content='' was used.
+        let is_contentless: bool = self.conn.query_row(
+            "SELECT COUNT(*) > 0 FROM prompts_fts_config WHERE k = 'content'",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(false);
+
+        if !is_contentless {
+            return Ok(());
+        }
+
+        eprintln!("[PromptVault] Migrating contentless FTS5 table to regular FTS5...");
+
+        self.conn.execute_batch("
+            BEGIN;
+            DROP TABLE IF EXISTS prompts_fts;
+            CREATE VIRTUAL TABLE prompts_fts USING fts5(
+                title,
+                content,
+                tokenize='porter unicode61'
+            );
+            -- Re-index all existing prompts
+            INSERT INTO prompts_fts (rowid, title, content)
+            SELECT p.id, p.title, COALESCE(pv.content_text, '')
+            FROM prompts p
+            LEFT JOIN prompt_versions pv ON pv.id = (
+                SELECT id FROM prompt_versions
+                WHERE prompt_id = p.id
+                ORDER BY version_number DESC LIMIT 1
+            );
+            COMMIT;
+        ")?;
+
+        eprintln!("[PromptVault] FTS5 migration complete.");
         Ok(())
     }
 
