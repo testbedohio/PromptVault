@@ -108,6 +108,91 @@ export async function deleteEmbeddingsByProvider(provider: string): Promise<numb
   return call<number>("delete_embeddings_by_provider", { provider });
 }
 
+// ─── Phase 6: SQL Vector Search ──────────────────────────────────
+
+export interface VectorSearchResult {
+  /** ID of the matching prompt. */
+  prompt_id: number;
+  /** Cosine similarity in [0, 1]; higher = more similar. */
+  similarity: number;
+}
+
+/**
+ * Perform a SQL-level cosine similarity search using sqlite-vec.
+ *
+ * Requires the sqlite-vec extension to be loaded (done automatically at
+ * startup). If the extension failed to load, this will throw — the caller
+ * should catch and fall back to JS-side cosine similarity.
+ *
+ * @param queryVector  Float32 embedding of the query text.
+ * @param provider     Provider name matching stored embeddings ("local", "gemini", "claude").
+ * @param topK         Maximum number of results to return (default 10).
+ */
+export async function vectorSearch(
+  queryVector: number[],
+  provider: string,
+  topK: number = 10
+): Promise<VectorSearchResult[]> {
+  return call<VectorSearchResult[]>("vector_search", { queryVector, provider, topK });
+}
+
+// ─── Export ──────────────────────────────────────────────────────
+
+/**
+ * Export all prompts to a string in the requested format.
+ *
+ * @param format  `"json"` for a structured JSON document, or `"markdown"` for
+ *                a human-readable Markdown file with one section per prompt.
+ * @returns       The full export as a string — pass to a Blob to trigger a download.
+ */
+export async function getExportData(format: "json" | "markdown"): Promise<string> {
+  return call<string>("get_export_data", { format });
+}
+
+// ─── Keyboard Shortcuts ───────────────────────────────────────────
+
+export interface ShortcutsConfig {
+  /** Open Command Palette  (default: ctrl+k) */
+  command_palette: string;
+  /** Create new prompt      (default: ctrl+n) */
+  new_prompt: string;
+  /** Open Brain Selector    (default: ctrl+b) */
+  brain_selector: string;
+  /** Toggle Inspector panel (default: ctrl+i) */
+  toggle_inspector: string;
+  /** Open Sync Panel        (default: ctrl+shift+s) */
+  sync_panel: string;
+  /** Open Export Dialog     (default: ctrl+shift+e) */
+  export: string;
+  /** Open Shortcuts dialog  (default: ctrl+,) */
+  shortcuts: string;
+}
+
+export const DEFAULT_SHORTCUTS: ShortcutsConfig = {
+  command_palette: "ctrl+k",
+  new_prompt: "ctrl+n",
+  brain_selector: "ctrl+b",
+  toggle_inspector: "ctrl+i",
+  sync_panel: "ctrl+shift+s",
+  export: "ctrl+shift+e",
+  shortcuts: "ctrl+,",
+};
+
+/**
+ * Load the persisted keyboard shortcuts configuration.
+ * Returns defaults if no configuration has been saved.
+ */
+export async function getShortcuts(): Promise<ShortcutsConfig> {
+  return call<ShortcutsConfig>("get_shortcuts");
+}
+
+/**
+ * Persist the keyboard shortcuts configuration to disk.
+ */
+export async function saveShortcuts(config: ShortcutsConfig): Promise<boolean> {
+  return call<boolean>("save_shortcuts", { config });
+}
+
 // ─── Sync ────────────────────────────────────────────────────────
 
 export interface SyncConfig {
@@ -124,6 +209,10 @@ export interface SyncConfig {
   auto_sync_enabled: boolean;
   /** How often the worker uploads, in minutes (5 / 15 / 30 / 60). */
   auto_sync_interval_mins: number;
+  /** Whether team/shared-vault mode is active. */
+  team_mode: boolean;
+  /** Drive File ID of the shared team vault. */
+  team_file_id: string | null;
 }
 
 export function isSyncConnected(config: SyncConfig): boolean {
@@ -144,7 +233,7 @@ export function getSyncStatusLabel(config: SyncConfig): string {
 }
 
 /**
- * Start the Google Drive OAuth 2.0 flow.
+ * Start the Google Drive OAuth 2.0 flow (personal mode — appDataFolder scope).
  *
  * Saves credentials, spawns a one-shot localhost:8741 callback listener,
  * and returns the Google authorization URL to open in the system browser.
@@ -156,6 +245,35 @@ export async function startOAuthFlow(
   clientSecret: string
 ): Promise<string> {
   return call<string>("start_oauth_flow", { clientId, clientSecret });
+}
+
+/**
+ * Start the Google Drive OAuth 2.0 flow in team mode (drive.file scope).
+ *
+ * Team mode creates files in the user's regular Drive root (not the hidden
+ * appDataFolder), making them shareable with teammates via Google Drive's
+ * sharing UI.
+ *
+ * After the user completes sign-in, call `syncToDrive()` to upload the vault
+ * and receive the team file ID — then share that ID with teammates.
+ */
+export async function startTeamOAuthFlow(
+  clientId: string,
+  clientSecret: string
+): Promise<string> {
+  return call<string>("start_team_oauth_flow", { clientId, clientSecret });
+}
+
+/**
+ * Connect this device to an existing shared team vault.
+ *
+ * The user must already be authenticated before calling this.  After calling,
+ * `syncToDrive()` will read/write the specified team file.
+ *
+ * @param fileId  Drive File ID shared by the vault creator.
+ */
+export async function connectTeamVault(fileId: string): Promise<boolean> {
+  return call<boolean>("connect_team_vault", { fileId });
 }
 
 export async function getSyncConfig(): Promise<SyncConfig> {
