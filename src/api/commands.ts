@@ -241,3 +241,50 @@ export async function resolveConflict(
 ): Promise<ResolveResult> {
   return call<ResolveResult>("resolve_conflict", { strategy });
 }
+
+// ─── Encryption ──────────────────────────────────────────────────
+
+export interface DbLockStatus {
+  /** True when the DB is encrypted (salt file exists). */
+  encrypted: boolean;
+  /** True when the key has been applied this session — always true if not encrypted. */
+  unlocked: boolean;
+}
+
+/**
+ * Check whether the database is encrypted and, if so, whether it is currently
+ * unlocked. Call this once on startup to determine whether to show the
+ * UnlockDialog.
+ */
+export async function getDbLockStatus(): Promise<DbLockStatus> {
+  return call<DbLockStatus>("get_db_lock_status");
+}
+
+/**
+ * Unlock an encrypted database using the master password.
+ *
+ * Derives the key from the stored salt + password (Argon2id) and applies it
+ * to the live SQLite connection. Returns `true` on success, throws on wrong
+ * password.
+ */
+export async function unlockDatabase(password: string): Promise<boolean> {
+  return call<boolean>("unlock_database", { password });
+}
+
+/**
+ * Set, change, or remove the master password.
+ *
+ * | `current`      | `newPassword`  | Effect                                    |
+ * |----------------|----------------|-------------------------------------------|
+ * | `null`         | `"pw"`         | Enable encryption on a plaintext DB       |
+ * | `"old"`        | `"new"`        | Change the password                       |
+ * | `"old"`        | `null`         | Remove encryption                         |
+ *
+ * Throws if `current` is wrong or missing when the DB is already encrypted.
+ */
+export async function setDbPassword(
+  current: string | null,
+  newPassword: string | null
+): Promise<boolean> {
+  return call<boolean>("set_db_password", { current, newPassword });
+}
