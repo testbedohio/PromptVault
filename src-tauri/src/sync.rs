@@ -16,12 +16,32 @@ pub struct SyncConfig {
     pub last_sync: Option<String>,
     pub sync_status: SyncStatus,
     /// Whether the periodic background sync worker should run.
-    /// Separate from `enabled` (which means OAuth is configured).
     #[serde(default)]
     pub auto_sync_enabled: bool,
     /// How often the background worker uploads, in minutes. Default: 5.
     #[serde(default = "default_interval")]
     pub auto_sync_interval_mins: u32,
+
+    // ── Team / Shared Vault ──────────────────────────────────────
+    //
+    // When `team_mode` is true, PromptVault syncs to a regular Drive file
+    // (drive.file scope) identified by `team_file_id`.  This file can be
+    // shared with teammates via the normal Google Drive sharing UI.
+    //
+    // When `team_mode` is false (default), the app uses the private
+    // appDataFolder (drive.appdata scope) stored in `remote_file_id`.
+    //
+    // Switching modes requires re-authorising with the appropriate scope.
+
+    /// True when team mode (drive.file scope, shared vault) is active.
+    #[serde(default)]
+    pub team_mode: bool,
+
+    /// Drive file ID for the shared vault (team mode only).
+    /// Set automatically after the first team upload, or manually
+    /// via `connect_team_vault` when joining an existing vault.
+    #[serde(default)]
+    pub team_file_id: Option<String>,
 }
 
 fn default_interval() -> u32 { 5 }
@@ -50,6 +70,8 @@ impl Default for SyncConfig {
             sync_status: SyncStatus::Disconnected,
             auto_sync_enabled: false,
             auto_sync_interval_mins: 5,
+            team_mode: false,
+            team_file_id: None,
         }
     }
 }
@@ -83,17 +105,9 @@ impl SyncConfig {
 }
 
 // ─── OAuth Callback Server ────────────────────────────────────────────────────
-//
-// Spins up a one-shot TCP listener on localhost:8741.
-// Google redirects to http://localhost:8741/callback?code=… after user consent.
-// The listener extracts the code, sends a friendly HTML response to the browser,
-// then returns the code (or an error) to the caller.
-//
-// This is a free function (not a method on DriveSync) so it can be called from
-// a spawned task that also holds the Arc<TokioMutex<DriveSync>>.
 
 const CALLBACK_PORT: u16 = 8741;
-const CALLBACK_TIMEOUT_SECS: u64 = 180; // 3-minute window for the user to consent
+const CALLBACK_TIMEOUT_SECS: u64 = 180;
 
 const SUCCESS_HTML: &str = r#"<!DOCTYPE html>
 <html lang="en">
@@ -162,11 +176,6 @@ const ERROR_HTML: &str = r#"<!DOCTYPE html>
 </body>
 </html>"#;
 
-/// Start a one-shot HTTP listener on localhost:8741 and wait for the Google
-/// OAuth callback. Returns the authorization code on success.
-///
-/// The listener automatically shuts down after one request or after
-/// CALLBACK_TIMEOUT_SECS seconds, whichever comes first.
 pub async fn await_oauth_callback() -> Result<String, String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -176,7 +185,6 @@ pub async fn await_oauth_callback() -> Result<String, String> {
         .await
         .map_err(|e| format!("Failed to start OAuth callback server on port {}: {}. Is port {} already in use?", CALLBACK_PORT, e, CALLBACK_PORT))?;
 
-    // Wait for Google's redirect within the timeout window
     let (mut stream, _addr) = timeout(
         Duration::from_secs(CALLBACK_TIMEOUT_SECS),
         listener.accept(),
@@ -185,7 +193,6 @@ pub async fn await_oauth_callback() -> Result<String, String> {
     .map_err(|_| format!("OAuth sign-in timed out after {} seconds. Please try again.", CALLBACK_TIMEOUT_SECS))?
     .map_err(|e| format!("Callback server accept error: {}", e))?;
 
-    // Read the HTTP request (first 8 KB is enough for the request line)
     let mut buf = [0u8; 8192];
     let n = timeout(Duration::from_secs(5), stream.read(&mut buf))
         .await
@@ -194,12 +201,10 @@ pub async fn await_oauth_callback() -> Result<String, String> {
 
     let request = String::from_utf8_lossy(&buf[..n]);
 
-    // Parse the request line: "GET /callback?code=XXXX&scope=... HTTP/1.1"
     let request_line = request.lines().next().unwrap_or("");
     let path_and_query = request_line.split_whitespace().nth(1).unwrap_or("");
     let query_string = path_and_query.split('?').nth(1).unwrap_or("");
 
-    // Extract ?code= and ?error= parameters
     let code = query_string
         .split('&')
         .find(|p| p.starts_with("code="))
@@ -210,7 +215,6 @@ pub async fn await_oauth_callback() -> Result<String, String> {
         .find(|p| p.starts_with("error="))
         .map(|p| urlencoding::decode(&p[6..]));
 
-    // Respond to the browser so it shows a proper page instead of a blank tab
     let (status_line, response_body) = if code.is_some() {
         ("HTTP/1.1 200 OK", SUCCESS_HTML)
     } else {
@@ -226,7 +230,6 @@ pub async fn await_oauth_callback() -> Result<String, String> {
     stream.write_all(response.as_bytes()).await.ok();
     stream.shutdown().await.ok();
 
-    // Return result after responding so the browser gets its page promptly
     if let Some(err_msg) = error {
         return Err(format!("Google declined authorization: {}", err_msg));
     }
@@ -257,15 +260,30 @@ impl DriveSync {
         Ok(())
     }
 
-    /// Build the Google OAuth 2.0 authorization URL.
+    // ── OAuth URL Builders ────────────────────────────────────────
+
+    /// Build the personal mode OAuth URL (drive.appdata scope — hidden, per-user folder).
     pub fn get_auth_url(&self) -> Result<String, String> {
         if self.config.client_id.is_empty() {
             return Err("Client ID not configured".to_string());
         }
+        self.build_auth_url("https://www.googleapis.com/auth/drive.appdata")
+    }
 
-        let scopes = "https://www.googleapis.com/auth/drive.appdata";
+    /// Build the team mode OAuth URL (drive.file scope — can create/access shared files).
+    ///
+    /// Unlike `drive.appdata`, `drive.file` grants access to files created by
+    /// PromptVault in the user's regular Drive, which can then be shared with
+    /// teammates via normal Drive sharing.
+    pub fn get_team_auth_url(&self) -> Result<String, String> {
+        if self.config.client_id.is_empty() {
+            return Err("Client ID not configured".to_string());
+        }
+        self.build_auth_url("https://www.googleapis.com/auth/drive.file")
+    }
+
+    fn build_auth_url(&self, scope: &str) -> Result<String, String> {
         let redirect = format!("http://localhost:{}/callback", CALLBACK_PORT);
-
         Ok(format!(
             "https://accounts.google.com/o/oauth2/v2/auth?\
             client_id={}&\
@@ -276,12 +294,12 @@ impl DriveSync {
             prompt=consent",
             self.config.client_id,
             urlencoding::encode(&redirect),
-            urlencoding::encode(scopes)
+            urlencoding::encode(scope)
         ))
     }
 
-    /// Exchange an authorization code for access + refresh tokens.
-    /// Called by the background listener task after receiving the callback.
+    // ── Token Exchange & Refresh ──────────────────────────────────
+
     pub async fn exchange_code(&mut self, code: &str) -> Result<(), String> {
         let redirect = format!("http://localhost:{}/callback", CALLBACK_PORT);
         let client = reqwest::Client::new();
@@ -324,7 +342,6 @@ impl DriveSync {
         Ok(())
     }
 
-    /// Refresh an expired access token using the stored refresh token.
     pub async fn refresh_access_token(&mut self) -> Result<(), String> {
         let refresh_token = self
             .config
@@ -365,18 +382,30 @@ impl DriveSync {
         Ok(())
     }
 
-    /// Ensure we have a valid access token, refreshing if it's expired or close to expiry.
     pub async fn ensure_fresh_token(&mut self) -> Result<(), String> {
         let expiry = self.config.token_expiry.unwrap_or(0);
-        // Refresh if token expires within 60 seconds
         if Utc::now().timestamp() + 60 >= expiry {
             self.refresh_access_token().await?;
         }
         Ok(())
     }
 
-    /// Upload the database to Google Drive appDataFolder.
+    // ── Upload ────────────────────────────────────────────────────
+    //
+    // Routes to personal (appDataFolder) or team (drive.file) based on
+    // the `team_mode` flag in the config.
+
     pub async fn upload_db(&mut self, db_path: &str) -> Result<(), String> {
+        if self.config.team_mode {
+            self.upload_db_team(db_path).await
+        } else {
+            self.upload_db_personal(db_path).await
+        }
+    }
+
+    /// Personal sync: upload to the hidden appDataFolder.
+    /// File is not visible in the user's regular Drive view.
+    async fn upload_db_personal(&mut self, db_path: &str) -> Result<(), String> {
         self.ensure_fresh_token().await?;
 
         let token = self
@@ -392,7 +421,6 @@ impl DriveSync {
         self.config.sync_status = SyncStatus::Syncing;
 
         if let Some(ref file_id) = self.config.remote_file_id.clone() {
-            // Update existing file via PATCH
             let url = format!(
                 "https://www.googleapis.com/upload/drive/v3/files/{}?uploadType=media",
                 file_id
@@ -413,7 +441,6 @@ impl DriveSync {
                 return Err(format!("Upload failed: {}", err));
             }
         } else {
-            // Create new file in appDataFolder via multipart
             let metadata = serde_json::json!({
                 "name": "prompt_vault.db",
                 "parents": ["appDataFolder"]
@@ -450,9 +477,7 @@ impl DriveSync {
             }
 
             #[derive(Deserialize)]
-            struct FileResponse {
-                id: String,
-            }
+            struct FileResponse { id: String }
 
             let file: FileResponse = response.json().await.map_err(|e| e.to_string())?;
             self.config.remote_file_id = Some(file.id);
@@ -464,15 +489,111 @@ impl DriveSync {
         Ok(())
     }
 
+    /// Team sync: upload to a regular Drive file (visible, shareable).
+    ///
+    /// On first use, creates a new file and stores its ID in `team_file_id`.
+    /// Subsequent uploads patch the same file.  The ID can be shared with
+    /// teammates who then call `connect_team_vault` to link their local vault.
+    async fn upload_db_team(&mut self, db_path: &str) -> Result<(), String> {
+        self.ensure_fresh_token().await?;
+
+        let token = self
+            .config
+            .access_token
+            .as_ref()
+            .ok_or("Not authenticated")?
+            .clone();
+
+        let db_bytes = fs::read(db_path).map_err(|e| e.to_string())?;
+        let client = reqwest::Client::new();
+
+        self.config.sync_status = SyncStatus::Syncing;
+
+        if let Some(ref file_id) = self.config.team_file_id.clone() {
+            // Update existing shared file
+            let url = format!(
+                "https://www.googleapis.com/upload/drive/v3/files/{}?uploadType=media",
+                file_id
+            );
+            let response = client
+                .patch(&url)
+                .bearer_auth(&token)
+                .header("Content-Type", "application/x-sqlite3")
+                .body(db_bytes)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+
+            if !response.status().is_success() {
+                let err = response.text().await.unwrap_or_default();
+                self.config.sync_status = SyncStatus::Error(format!("Team upload failed: {}", err));
+                self.config.save().ok();
+                return Err(format!("Team upload failed: {}", err));
+            }
+        } else {
+            // Create a new shared file in Drive root (no parent = My Drive root)
+            let metadata = serde_json::json!({
+                "name": "prompt_vault_shared.db",
+                "description": "PromptVault shared prompt database"
+            });
+
+            let boundary = "promptvault_team_boundary";
+            let header_part = format!(
+                "--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{}\r\n--{boundary}\r\nContent-Type: application/x-sqlite3\r\n\r\n",
+                metadata
+            );
+
+            let mut full_body = header_part.into_bytes();
+            full_body.extend_from_slice(&db_bytes);
+            full_body.extend_from_slice(format!("\r\n--{boundary}--").as_bytes());
+
+            let url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart";
+            let response = client
+                .post(url)
+                .bearer_auth(&token)
+                .header(
+                    "Content-Type",
+                    format!("multipart/related; boundary={}", boundary),
+                )
+                .body(full_body)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+
+            if !response.status().is_success() {
+                let err = response.text().await.unwrap_or_default();
+                self.config.sync_status = SyncStatus::Error(format!("Team vault create failed: {}", err));
+                self.config.save().ok();
+                return Err(format!("Team vault create failed: {}", err));
+            }
+
+            #[derive(Deserialize)]
+            struct FileResponse { id: String }
+
+            let file: FileResponse = response.json().await.map_err(|e| e.to_string())?;
+            self.config.team_file_id = Some(file.id);
+        }
+
+        self.config.last_sync = Some(Utc::now().to_rfc3339());
+        self.config.sync_status = SyncStatus::Synced;
+        self.config.save()?;
+        Ok(())
+    }
+
+    // ── Download ──────────────────────────────────────────────────
+    //
+    // Routes to the correct file ID based on team_mode.
+
     /// Download the remote database file to `dest_path`.
-    ///
-    /// Used by `resolve_conflict` when the user chooses "Accept Newest" and
-    /// the remote turns out to be newer. The caller (lib.rs) then calls
-    /// `db.restore_from(dest_path)` to swap the live connection's contents.
-    ///
-    /// `dest_path` should be a sibling of the live DB (e.g. `.../prompt_vault_incoming.db`)
-    /// so that it lands on the same filesystem and cleanup is trivial.
     pub async fn download_db(&mut self, dest_path: &str) -> Result<(), String> {
+        if self.config.team_mode {
+            self.download_db_team(dest_path).await
+        } else {
+            self.download_db_personal(dest_path).await
+        }
+    }
+
+    async fn download_db_personal(&mut self, dest_path: &str) -> Result<(), String> {
         self.ensure_fresh_token().await?;
 
         let token = self
@@ -489,6 +610,30 @@ impl DriveSync {
             .ok_or("No remote file ID — cannot download")?
             .clone();
 
+        self.download_file_by_id(&token, &file_id, dest_path).await
+    }
+
+    async fn download_db_team(&mut self, dest_path: &str) -> Result<(), String> {
+        self.ensure_fresh_token().await?;
+
+        let token = self
+            .config
+            .access_token
+            .as_ref()
+            .ok_or("Not authenticated")?
+            .clone();
+
+        let file_id = self
+            .config
+            .team_file_id
+            .as_ref()
+            .ok_or("No team vault file ID — use 'Connect to existing vault' to link one")?
+            .clone();
+
+        self.download_file_by_id(&token, &file_id, dest_path).await
+    }
+
+    async fn download_file_by_id(&self, token: &str, file_id: &str, dest_path: &str) -> Result<(), String> {
         let client = reqwest::Client::new();
         let url = format!(
             "https://www.googleapis.com/drive/v3/files/{}?alt=media",
@@ -497,7 +642,7 @@ impl DriveSync {
 
         let response = client
             .get(&url)
-            .bearer_auth(&token)
+            .bearer_auth(token)
             .send()
             .await
             .map_err(|e| e.to_string())?;
@@ -513,8 +658,10 @@ impl DriveSync {
         Ok(())
     }
 
-    /// Check whether the remote file is newer than the last local sync.
-    /// Returns the remote ISO 8601 modifiedTime string if the file exists.
+    // ── Remote Status Check ───────────────────────────────────────
+    //
+    // Returns the modifiedTime of the active remote file (personal or team).
+
     pub async fn check_remote_status(&self) -> Result<Option<String>, String> {
         let token = self
             .config
@@ -522,11 +669,17 @@ impl DriveSync {
             .as_ref()
             .ok_or("Not authenticated")?;
 
-        let file_id = self
-            .config
-            .remote_file_id
-            .as_ref()
-            .ok_or("No remote file")?;
+        let file_id = if self.config.team_mode {
+            self.config
+                .team_file_id
+                .as_ref()
+                .ok_or("No team file ID")?
+        } else {
+            self.config
+                .remote_file_id
+                .as_ref()
+                .ok_or("No remote file")?
+        };
 
         let client = reqwest::Client::new();
         let url = format!(
@@ -559,14 +712,12 @@ impl DriveSync {
 // ─── URL encoding helpers ─────────────────────────────────────────────────────
 
 mod urlencoding {
-    /// Percent-encode a string for use in URL query parameters (RFC 3986).
     pub fn encode(s: &str) -> String {
         s.chars()
             .flat_map(|c| {
                 if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') {
                     vec![c]
                 } else {
-                    // Multi-byte UTF-8: encode each byte separately
                     c.to_string()
                         .as_bytes()
                         .iter()
@@ -577,7 +728,6 @@ mod urlencoding {
             .collect()
     }
 
-    /// Percent-decode a URL query parameter value (best-effort ASCII).
     pub fn decode(s: &str) -> String {
         let mut result = String::with_capacity(s.len());
         let mut chars = s.chars().peekable();
