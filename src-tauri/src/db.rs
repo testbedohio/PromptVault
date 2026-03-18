@@ -39,6 +39,7 @@ pub struct Prompt {
     pub title: String,
     pub content: String,
     pub category_id: Option<i64>,
+    pub icon: Option<String>,
     pub tags: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -207,7 +208,22 @@ impl Database {
         // This is a no-op on fresh installs.
         self.migrate_embeddings_to_composite_pk()?;
         self.migrate_fts_contentless()?;
+        self.migrate_add_icon_column()?;
 
+        Ok(())
+    }
+
+    /// Add `icon` column to the `prompts` table if it doesn't exist yet.
+    fn migrate_add_icon_column(&self) -> Result<()> {
+        let has_icon: bool = self.conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('prompts') WHERE name = 'icon'",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(false);
+
+        if !has_icon {
+            self.conn.execute("ALTER TABLE prompts ADD COLUMN icon TEXT", [])?;
+        }
         Ok(())
     }
 
@@ -262,14 +278,16 @@ impl Database {
     /// rowids, which breaks `update_prompt` and `delete_prompt`. This migration
     /// is a no-op on fresh installs or databases already using a regular table.
     fn migrate_fts_contentless(&self) -> Result<()> {
-        // The fts5vocab / fts config stores 'content' key when content='' was used.
-        let is_contentless: bool = self.conn.query_row(
-            "SELECT COUNT(*) > 0 FROM prompts_fts_config WHERE k = 'content'",
+        // A regular (non-contentless) FTS5 table has a shadow table named
+        // `<table>_content`.  If that shadow table is missing, the FTS5 table
+        // is contentless and must be recreated.
+        let has_content_table: bool = self.conn.query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='prompts_fts_content'",
             [],
             |row| row.get(0),
         ).unwrap_or(false);
 
-        if !is_contentless {
+        if has_content_table {
             return Ok(());
         }
 
@@ -326,12 +344,28 @@ impl Database {
         Ok(Category { id, name: name.to_string(), parent_id, created_at: now })
     }
 
+    pub fn rename_category(&self, id: i64, name: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE categories SET name = ?1 WHERE id = ?2",
+            params![name, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_category(&self, id: i64) -> Result<()> {
+        // Schema has ON DELETE SET NULL for both prompts.category_id
+        // and categories.parent_id, so child prompts become uncategorized
+        // and child folders become top-level.
+        self.conn.execute("DELETE FROM categories WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
     // ── Prompts ──────────────────────────────────────────────────
 
     pub fn get_prompts(&self) -> Result<Vec<Prompt>> {
         let mut stmt = self.conn.prepare(
             "SELECT p.id, p.title, p.category_id, p.created_at, p.updated_at,
-                    COALESCE(pv.content_text, '') as content
+                    COALESCE(pv.content_text, '') as content, p.icon
              FROM prompts p
              LEFT JOIN prompt_versions pv ON pv.id = (
                  SELECT id FROM prompt_versions
@@ -341,7 +375,7 @@ impl Database {
              ORDER BY p.updated_at DESC"
         )?;
 
-        let prompts: Vec<(i64, String, Option<i64>, String, String, String)> = stmt
+        let prompts: Vec<(i64, String, Option<i64>, String, String, String, Option<String>)> = stmt
             .query_map([], |row| {
                 Ok((
                     row.get(0)?,
@@ -350,15 +384,16 @@ impl Database {
                     row.get(3)?,
                     row.get(4)?,
                     row.get(5)?,
+                    row.get(6)?,
                 ))
             })?
             .collect::<Result<Vec<_>>>()?;
 
         let mut result = Vec::new();
-        for (id, title, category_id, created_at, updated_at, content) in prompts {
+        for (id, title, category_id, created_at, updated_at, content, icon) in prompts {
             let tags = self.get_tags_for_prompt(id)?;
             result.push(Prompt {
-                id, title, content, category_id, tags, created_at, updated_at,
+                id, title, content, category_id, icon, tags, created_at, updated_at,
             });
         }
         Ok(result)
@@ -367,7 +402,7 @@ impl Database {
     pub fn get_prompt_by_id(&self, id: i64) -> Result<Prompt> {
         let mut stmt = self.conn.prepare(
             "SELECT p.id, p.title, p.category_id, p.created_at, p.updated_at,
-                    COALESCE(pv.content_text, '') as content
+                    COALESCE(pv.content_text, '') as content, p.icon
              FROM prompts p
              LEFT JOIN prompt_versions pv ON pv.id = (
                  SELECT id FROM prompt_versions
@@ -385,6 +420,7 @@ impl Database {
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
             ))
         })?;
 
@@ -394,6 +430,7 @@ impl Database {
             title: prompt.1,
             content: prompt.5,
             category_id: prompt.2,
+            icon: prompt.6,
             tags,
             created_at: prompt.3,
             updated_at: prompt.4,
@@ -437,6 +474,7 @@ impl Database {
             title: title.to_string(),
             content: content.to_string(),
             category_id,
+            icon: None,
             tags: tag_names,
             created_at: now.clone(),
             updated_at: now,
@@ -448,8 +486,9 @@ impl Database {
         id: i64,
         title: Option<&str>,
         content: Option<&str>,
-        category_id: Option<i64>,
+        category_id: Option<Option<i64>>,
         tags: Option<&[String]>,
+        icon: Option<Option<&str>>,
     ) -> Result<Prompt> {
         let now = Utc::now().to_rfc3339();
 
@@ -460,6 +499,14 @@ impl Database {
             )?;
         }
 
+        if let Some(icon_val) = icon {
+            self.conn.execute(
+                "UPDATE prompts SET icon = ?1, updated_at = ?2 WHERE id = ?3",
+                params![icon_val, now, id],
+            )?;
+        }
+
+        // Some(Some(id)) = move to folder, Some(None) = uncategorize, None = no change
         if let Some(cat) = category_id {
             self.conn.execute(
                 "UPDATE prompts SET category_id = ?1, updated_at = ?2 WHERE id = ?3",
@@ -505,8 +552,12 @@ impl Database {
     }
 
     pub fn delete_prompt(&self, id: i64) -> Result<()> {
-        self.conn.execute("DELETE FROM prompts_fts WHERE rowid = ?1", params![id])?;
+        // Delete the prompt row first (cascades to versions, embeddings, tags).
         self.conn.execute("DELETE FROM prompts WHERE id = ?1", params![id])?;
+        // Clean up the FTS index; tolerate failure (e.g. contentless table edge case).
+        if let Err(e) = self.conn.execute("DELETE FROM prompts_fts WHERE rowid = ?1", params![id]) {
+            eprintln!("[PromptVault] warning: FTS cleanup failed for id {}: {}", id, e);
+        }
         Ok(())
     }
 
@@ -590,7 +641,7 @@ impl Database {
 
         let mut stmt = self.conn.prepare(
             "SELECT p.id, p.title, p.category_id, p.created_at, p.updated_at,
-                    COALESCE(pv.content_text, '') as content
+                    COALESCE(pv.content_text, '') as content, p.icon
              FROM prompts p
              INNER JOIN prompts_fts fts ON fts.rowid = p.id
              LEFT JOIN prompt_versions pv ON pv.id = (
@@ -602,7 +653,7 @@ impl Database {
              ORDER BY rank"
         )?;
 
-        let prompts: Vec<(i64, String, Option<i64>, String, String, String)> = stmt
+        let prompts: Vec<(i64, String, Option<i64>, String, String, String, Option<String>)> = stmt
             .query_map(params![fts_query], |row| {
                 Ok((
                     row.get(0)?,
@@ -611,15 +662,16 @@ impl Database {
                     row.get(3)?,
                     row.get(4)?,
                     row.get(5)?,
+                    row.get(6)?,
                 ))
             })?
             .collect::<Result<Vec<_>>>()?;
 
         let mut result = Vec::new();
-        for (id, title, category_id, created_at, updated_at, content) in prompts {
+        for (id, title, category_id, created_at, updated_at, content, icon) in prompts {
             let tags = self.get_tags_for_prompt(id)?;
             result.push(Prompt {
-                id, title, content, category_id, tags, created_at, updated_at,
+                id, title, content, category_id, icon, tags, created_at, updated_at,
             });
         }
         Ok(result)
@@ -828,6 +880,7 @@ impl Database {
                 StepResult::More => {
                     std::thread::sleep(Duration::from_millis(250));
                 }
+                _ => break,
             }
         }
 

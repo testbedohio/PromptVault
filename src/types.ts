@@ -22,6 +22,7 @@ export interface Prompt {
   title: string;
   content: string;
   category_id: number | null;
+  icon: string | null;
   tags: string[];
   created_at: string;
   updated_at: string;
@@ -50,6 +51,7 @@ export interface UpdatePromptInput {
   content?: string;
   category_id?: number | null;
   tags?: string[];
+  icon?: string | null;
 }
 
 // ─── API Response Wrapper ────────────────────────────────────────

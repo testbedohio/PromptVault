@@ -7,6 +7,8 @@ interface EditorPanelProps {
   prompts: Prompt[];
   openTabs: number[];
   activeTab: number;
+  stripedLines: boolean;
+  minimap: boolean;
   onSelectTab: (id: number) => void;
   onCloseTab: (id: number) => void;
   onSave: (
@@ -18,9 +20,13 @@ interface EditorPanelProps {
 function EditorContent({
   snippet,
   onSave,
+  stripedLines,
+  minimap,
 }: {
   snippet: Prompt;
   onSave: EditorPanelProps["onSave"];
+  stripedLines: boolean;
+  minimap: boolean;
 }) {
   const [content, setContent] = useState(snippet.content);
 
@@ -66,6 +72,8 @@ function EditorContent({
           value={content}
           onChange={handleChange}
           fileName={snippet.title}
+          stripedLines={stripedLines}
+          minimap={minimap}
         />
       </div>
     </div>
@@ -76,6 +84,8 @@ export default function EditorPanel({
   prompts,
   openTabs,
   activeTab,
+  stripedLines,
+  minimap,
   onSelectTab,
   onCloseTab,
   onSave,
@@ -119,6 +129,8 @@ export default function EditorPanel({
             key={activeSnippet.id}
             snippet={activeSnippet}
             onSave={onSave}
+            stripedLines={stripedLines}
+            minimap={minimap}
           />
         ) : (
           <div className="flex items-center justify-center h-full">

@@ -10,6 +10,10 @@ interface MonacoEditorProps {
   readOnly?: boolean;
   /** File title used for language detection */
   fileName?: string;
+  /** Show alternating line background colors */
+  stripedLines?: boolean;
+  /** Show minimap code overview */
+  minimap?: boolean;
 }
 
 /** Detect language from file extension */
@@ -44,8 +48,11 @@ export default function MonacoEditorWrapper({
   language,
   readOnly = false,
   fileName,
+  stripedLines = false,
+  minimap: minimapEnabled = true,
 }: MonacoEditorProps) {
   const editorRef = useRef<editor.IStandaloneCodeEditor | null>(null);
+  const decorationsRef = useRef<editor.IEditorDecorationsCollection | null>(null);
 
   const resolvedLanguage = language ?? detectLanguage(fileName);
 
@@ -94,6 +101,45 @@ export default function MonacoEditorWrapper({
     [onChange]
   );
 
+  // Toggle minimap reactively
+  useEffect(() => {
+    if (editorRef.current) {
+      editorRef.current.updateOptions({ minimap: { enabled: minimapEnabled, maxColumn: 80 } });
+    }
+  }, [minimapEnabled]);
+
+  // Apply alternating line stripes
+  useEffect(() => {
+    const ed = editorRef.current;
+    if (!ed) return;
+
+    if (!stripedLines) {
+      decorationsRef.current?.clear();
+      return;
+    }
+
+    const applyStripes = () => {
+      const model = ed.getModel();
+      if (!model) return;
+      const lineCount = model.getLineCount();
+      const newDecorations: editor.IModelDeltaDecoration[] = [];
+      for (let i = 2; i <= lineCount; i += 2) {
+        newDecorations.push({
+          range: { startLineNumber: i, startColumn: 1, endLineNumber: i, endColumn: 1 },
+          options: { isWholeLine: true, className: "pv-stripe-line" },
+        });
+      }
+      if (decorationsRef.current) {
+        decorationsRef.current.clear();
+      }
+      decorationsRef.current = ed.createDecorationsCollection(newDecorations);
+    };
+
+    applyStripes();
+    const disposable = ed.onDidChangeModelContent(() => applyStripes());
+    return () => disposable.dispose();
+  }, [stripedLines, value]);
+
   // Update language when fileName changes
   useEffect(() => {
     if (editorRef.current) {
@@ -133,7 +179,7 @@ export default function MonacoEditorWrapper({
 
         // Editor behavior
         readOnly,
-        minimap: { enabled: true, maxColumn: 80 },
+        minimap: { enabled: minimapEnabled, maxColumn: 80 },
         scrollBeyondLastLine: false,
         smoothScrolling: true,
         cursorBlinking: "smooth",
@@ -180,7 +226,7 @@ export default function MonacoEditorWrapper({
         contextmenu: true,
         links: true,
         overviewRulerBorder: false,
-        padding: { top: 12, bottom: 12 },
+        padding: { top: 4, bottom: 12 },
       }}
     />
   );

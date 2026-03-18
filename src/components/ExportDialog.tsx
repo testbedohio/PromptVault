@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { getExportData } from "../api/commands";
+import { exportPromptsJson, exportPromptMarkdown, downloadFile } from "../api/commands";
 
 interface ExportDialogProps {
   promptCount: number;
@@ -18,29 +18,17 @@ export default function ExportDialog({ promptCount, onClose }: ExportDialogProps
     setError(null);
 
     try {
-      const data = await getExportData(format);
+      const data = format === "json"
+        ? await exportPromptsJson([])
+        : await exportPromptMarkdown(0); // 0 exports all
 
-      // Build a Blob and trigger a browser-style download.
-      // Works in both Tauri (webview) and browser dev mode.
       const mimeType = format === "json" ? "application/json" : "text/markdown";
       const extension = format === "json" ? "json" : "md";
       const filename = `promptvault_export_${new Date()
         .toISOString()
         .slice(0, 10)}.${extension}`;
 
-      const blob = new Blob([data], { type: mimeType });
-      const url = URL.createObjectURL(blob);
-
-      const anchor = document.createElement("a");
-      anchor.href = url;
-      anchor.download = filename;
-      anchor.style.display = "none";
-      document.body.appendChild(anchor);
-      anchor.click();
-      document.body.removeChild(anchor);
-
-      // Clean up the object URL after a short delay
-      setTimeout(() => URL.revokeObjectURL(url), 5000);
+      downloadFile(data, filename, mimeType);
 
       onClose();
     } catch (e) {

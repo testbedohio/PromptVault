@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { setDbPassword, getDbLockStatus } from "../api/commands";
+import { setDbPassword } from "../api/commands";
 
 interface SetPasswordDialogProps {
   isEncrypted: boolean;

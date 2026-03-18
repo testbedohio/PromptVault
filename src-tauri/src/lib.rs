@@ -146,6 +146,22 @@ fn create_category(name: String, parent_id: Option<i64>, state: State<AppState>)
     }
 }
 
+#[tauri::command]
+fn rename_category(id: i64, name: String, state: State<AppState>) -> ApiResult<bool> {
+    match state.db.lock().unwrap().rename_category(id, &name) {
+        Ok(_) => ok(true),
+        Err(e) => err(&e.to_string()),
+    }
+}
+
+#[tauri::command]
+fn delete_category(id: i64, state: State<AppState>) -> ApiResult<bool> {
+    match state.db.lock().unwrap().delete_category(id) {
+        Ok(_) => ok(true),
+        Err(e) => err(&e.to_string()),
+    }
+}
+
 // -- Prompts --
 
 #[tauri::command]
@@ -186,14 +202,16 @@ struct UpdatePromptInput {
     id: i64,
     title: Option<String>,
     content: Option<String>,
-    category_id: Option<i64>,
+    category_id: Option<Option<i64>>,
     tags: Option<Vec<String>>,
+    icon: Option<Option<String>>,
 }
 
 #[tauri::command]
 fn update_prompt(input: UpdatePromptInput, state: State<AppState>) -> ApiResult<Prompt> {
     let db = state.db.lock().unwrap();
-    match db.update_prompt(input.id, input.title.as_deref(), input.content.as_deref(), input.category_id, input.tags.as_deref()) {
+    let icon_ref = input.icon.as_ref().map(|o| o.as_deref());
+    match db.update_prompt(input.id, input.title.as_deref(), input.content.as_deref(), input.category_id, input.tags.as_deref(), icon_ref) {
         Ok(prompt) => ok(prompt),
         Err(e) => err(&e.to_string()),
     }
@@ -982,6 +1000,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_categories,
             create_category,
+            rename_category,
+            delete_category,
             get_prompts,
             get_prompt_by_id,
             create_prompt,

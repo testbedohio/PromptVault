@@ -79,4 +79,9 @@
     @apply inline-flex items-center gap-1 px-1.5 py-0.5 text-2xs font-mono
            rounded-sm bg-darcula-bg-lighter text-darcula-text-muted;
   }
+
+  /* Monaco alternating line stripe — color set via CSS custom property */
+  .pv-stripe-line {
+    background-color: var(--pv-stripe-color, rgba(75, 110, 175, 0.10));
+  }
 }

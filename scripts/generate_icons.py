@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Generate PromptVault app icons for all platforms.
+Generate PromptVault app icons for all platforms by resizing a source PNG.
 
 Requirements:
     pip3 install Pillow
@@ -9,76 +9,49 @@ Usage:
     python3 scripts/generate_icons.py
 """
 
-import math
 import os
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 
 
-def make_icon(size: int) -> Image.Image:
-    """Generate a PromptVault hex icon at the given pixel size."""
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
+# Source icon (2000x2000 RGB PNG) — converted to RGBA for output.
+SOURCE_ICON = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "PromptVault_Icon.png",
+)
 
-    # Background circle (Darcula accent blue)
-    margin = int(size * 0.05)
-    draw.ellipse(
-        [margin, margin, size - margin, size - margin],
-        fill=(75, 110, 175),
-    )
 
-    # Hexagon
-    cx, cy = size // 2, size // 2
-    r = int(size * 0.32)
-    hex_points = [
-        (cx + r * math.cos(math.radians(60 * i - 30)),
-         cy + r * math.sin(math.radians(60 * i - 30)))
-        for i in range(6)
-    ]
-    draw.polygon(
-        hex_points,
-        fill=(92, 142, 214),
-        outline=(169, 183, 198),
-        width=max(1, size // 64),
-    )
+def load_source() -> Image.Image:
+    """Load the source icon, crop to content, and convert to RGBA."""
+    img = Image.open(SOURCE_ICON)
+    if img.mode != "RGBA":
+        img = img.convert("RGBA")
 
-    # "P" in center
-    font_size = int(size * 0.30)
-    try:
-        # Try common system font paths
-        for font_path in [
-            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
-            "/System/Library/Fonts/Menlo.ttc",
-            "/System/Library/Fonts/SFMono-Bold.otf",
-            "C:/Windows/Fonts/consola.ttf",
-        ]:
-            if os.path.exists(font_path):
-                font = ImageFont.truetype(font_path, font_size)
-                break
-        else:
-            font = ImageFont.load_default()
-    except Exception:
-        font = ImageFont.load_default()
+    # Crop to the bounding box of non-transparent content (removes surrounding whitespace/black)
+    bbox = img.getbbox()
+    if bbox:
+        img = img.crop(bbox)
 
-    bbox = draw.textbbox((0, 0), "P", font=font)
-    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    draw.text(
-        (cx - tw // 2 - bbox[0], cy - th // 2 - bbox[1]),
-        "P",
-        fill=(255, 255, 255),
-        font=font,
-    )
+    # Make square by padding the shorter axis with transparency
+    w, h = img.size
+    if w != h:
+        side = max(w, h)
+        square = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+        square.paste(img, ((side - w) // 2, (side - h) // 2))
+        img = square
 
     return img
 
 
 def main():
-    # Output directory
     script_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(script_dir)
     icons_dir = os.path.join(project_root, "src-tauri", "icons")
     os.makedirs(icons_dir, exist_ok=True)
 
-    # Generate PNGs at required sizes
+    source = load_source()
+    print(f"Source: {SOURCE_ICON}  ({source.size[0]}x{source.size[1]} {source.mode})\n")
+
+    # PNG targets
     targets = [
         (32, "32x32.png"),
         (128, "128x128.png"),
@@ -87,20 +60,23 @@ def main():
     ]
 
     for size, filename in targets:
-        img = make_icon(size)
+        resized = source.resize((size, size), Image.LANCZOS)
         path = os.path.join(icons_dir, filename)
-        img.save(path, "PNG")
+        resized.save(path, "PNG")
         print(f"  {filename:20s} {size}x{size}  ({os.path.getsize(path)} bytes)")
 
-    # Generate .ico (Windows) — multi-resolution
+    # ICO (Windows) — multi-resolution
+    # Pillow's ICO writer needs the largest image saved with sizes= to embed
+    # multiple resolutions. It downscales internally, but we pre-resize with
+    # LANCZOS for best quality and pass all frames via append_images.
     ico_sizes = [16, 32, 48, 256]
-    ico_images = [make_icon(s) for s in ico_sizes]
+    ico_images = [source.resize((s, s), Image.LANCZOS) for s in ico_sizes]
     ico_path = os.path.join(icons_dir, "icon.ico")
-    ico_images[0].save(
+    # Save the 256px image as the base, append smaller ones.
+    ico_images[-1].save(
         ico_path,
         format="ICO",
-        sizes=[(s, s) for s in ico_sizes],
-        append_images=ico_images[1:],
+        append_images=ico_images[:-1],
     )
     print(f"  {'icon.ico':20s} multi   ({os.path.getsize(ico_path)} bytes)")
 

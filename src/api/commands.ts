@@ -32,6 +32,14 @@ export async function createCategory(
   return call<Category>("create_category", { name, parentId });
 }
 
+export async function renameCategory(id: number, name: string): Promise<boolean> {
+  return call<boolean>("rename_category", { id, name });
+}
+
+export async function deleteCategory(id: number): Promise<boolean> {
+  return call<boolean>("delete_category", { id });
+}
+
 // ─── Prompts ─────────────────────────────────────────────────────
 
 export async function getPrompts(): Promise<Prompt[]> {

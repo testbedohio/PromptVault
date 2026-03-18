@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useVersions } from "../hooks/useAppData";
 import DiffViewer from "./DiffViewer";
 import type { Prompt } from "../types";
+import { PROMPT_ICONS, getIconEntry } from "../promptIcons";
 import {
   exportPromptMarkdown,
   exportPromptsJson,
@@ -14,7 +15,7 @@ interface InspectorProps {
   onOpenSync: () => void;
   onSave: (
     id: number,
-    updates: { title?: string; content?: string; tags?: string[] }
+    updates: { title?: string; content?: string; tags?: string[]; icon?: string | null }
   ) => Promise<Prompt | null>;
 }
 
@@ -27,20 +28,26 @@ function Section({
   children: React.ReactNode;
   defaultOpen?: boolean;
 }) {
+  const [open, setOpen] = useState(defaultOpen);
   return (
-    <details open={defaultOpen} className="group">
-      <summary className="flex items-center gap-2 px-3 py-2 cursor-pointer select-none border-b border-darcula-border hover:bg-darcula-bg-lighter transition-colors">
-        <span className="text-2xs text-darcula-text-muted group-open:rotate-90 transition-transform">
+    <div>
+      <button
+        className="flex items-center gap-2 px-3 py-2 w-full cursor-pointer select-none border-b border-darcula-border hover:bg-darcula-bg-lighter transition-colors text-left"
+        onClick={() => setOpen((prev) => !prev)}
+      >
+        <span className={`text-2xs text-darcula-text-muted transition-transform ${open ? "rotate-90" : ""}`}>
           ▶
         </span>
         <span className="text-xs font-mono font-semibold text-darcula-text-muted uppercase tracking-wider">
           {title}
         </span>
-      </summary>
-      <div className="px-3 py-2 border-b border-darcula-border">
-        {children}
-      </div>
-    </details>
+      </button>
+      {open && (
+        <div className="px-3 py-2 border-b border-darcula-border">
+          {children}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -87,6 +94,7 @@ export default function Inspector({ snippet, onDelete, onSave, onOpenSync }: Ins
     newLabel: string;
   } | null>(null);
   const [exporting, setExporting] = useState(false);
+  const [iconPickerOpen, setIconPickerOpen] = useState(false);
 
   if (!snippet) {
     return (
@@ -171,6 +179,38 @@ export default function Inspector({ snippet, onDelete, onSave, onOpenSync }: Ins
         <MetadataRow label="Words" value={String(wordCount)} />
         <MetadataRow label="Characters" value={String(charCount)} />
         <MetadataRow label="Lines" value={String(lineCount)} />
+        {/* Icon picker */}
+        <div className="flex justify-between items-center py-1">
+          <span className="text-2xs font-mono text-darcula-text-muted">Icon</span>
+          <button
+            className="text-sm px-1.5 py-0.5 rounded-sm hover:bg-darcula-bg-lighter transition-colors"
+            onClick={() => setIconPickerOpen((p) => !p)}
+            title="Change icon"
+          >
+            {getIconEntry(snippet.icon).char}
+          </button>
+        </div>
+        {iconPickerOpen && (
+          <div className="grid grid-cols-6 gap-1 py-1.5">
+            {PROMPT_ICONS.map((entry) => (
+              <button
+                key={entry.key}
+                className={`text-sm p-1 rounded-sm transition-colors text-center ${
+                  snippet.icon === entry.key || (!snippet.icon && entry.key === "file")
+                    ? "bg-darcula-accent/30 ring-1 ring-darcula-accent"
+                    : "hover:bg-darcula-bg-lighter"
+                }`}
+                title={entry.label}
+                onClick={() => {
+                  onSave(snippet.id, { icon: entry.key === "file" ? null : entry.key });
+                  setIconPickerOpen(false);
+                }}
+              >
+                {entry.char}
+              </button>
+            ))}
+          </div>
+        )}
       </Section>
 
       {/* Tags */}
@@ -314,7 +354,7 @@ export default function Inspector({ snippet, onDelete, onSave, onOpenSync }: Ins
       </Section>
 
       {/* Actions */}
-      <Section title="Actions" defaultOpen={false}>
+      <Section title="Actions">
         {confirmDelete ? (
           <div className="space-y-2">
             <p className="text-2xs font-mono text-darcula-error">
@@ -323,9 +363,9 @@ export default function Inspector({ snippet, onDelete, onSave, onOpenSync }: Ins
             <div className="flex gap-2">
               <button
                 className="text-2xs font-mono px-2 py-1 rounded-sm bg-darcula-error text-white hover:bg-red-600 transition-colors"
-                onClick={() => {
-                  onDelete(snippet.id);
+                onClick={async () => {
                   setConfirmDelete(false);
+                  await onDelete(snippet.id);
                 }}
               >
                 Confirm Delete

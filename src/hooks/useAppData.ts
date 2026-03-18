@@ -33,6 +33,7 @@ const SAMPLE_PROMPTS: Prompt[] = [
     content:
       '# Code Review Agent\n\nYou are a senior software engineer conducting a thorough code review.\n\n## Guidelines\n- Check for **security vulnerabilities**\n- Ensure proper error handling\n- Verify naming conventions\n\n```python\ndef review(code: str) -> dict:\n    """Analyze code and return findings."""\n    findings = []\n    # Analysis logic here\n    return {"findings": findings, "score": 0.85}\n```',
     category_id: 1,
+    icon: "robot",
     tags: ["python", "claude", "system"],
     created_at: "2025-03-10T14:30:00Z",
     updated_at: "2025-03-12T09:15:00Z",
@@ -43,6 +44,7 @@ const SAMPLE_PROMPTS: Prompt[] = [
     content:
       "# SQL Query Optimizer\n\nAnalyze the following SQL query and suggest optimizations.\n\nFocus on:\n- Index usage\n- JOIN efficiency\n- Subquery elimination",
     category_id: 2,
+    icon: "database",
     tags: ["sql", "gpt-4"],
     created_at: "2025-03-08T10:00:00Z",
     updated_at: "2025-03-11T16:45:00Z",
@@ -53,6 +55,7 @@ const SAMPLE_PROMPTS: Prompt[] = [
     content:
       '# Few-Shot Classification Prompt\n\nClassify the following text into one of these categories: [Bug, Feature, Question]\n\n## Examples\n- "The app crashes on login" → Bug\n- "Can we add dark mode?" → Feature\n- "How do I export data?" → Question\n\n## Input\n{user_input}',
     category_id: 3,
+    icon: "lightbulb",
     tags: ["few-shot", "chain-of-thought"],
     created_at: "2025-03-05T08:20:00Z",
     updated_at: "2025-03-10T11:30:00Z",
@@ -163,6 +166,7 @@ export function useAppData() {
           title: input.title,
           content: input.content,
           category_id: input.category_id,
+          icon: null,
           tags: input.tags,
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
@@ -189,7 +193,7 @@ export function useAppData() {
   const savePrompt = useCallback(
     async (
       id: number,
-      updates: { title?: string; content?: string; category_id?: number | null; tags?: string[] }
+      updates: { title?: string; content?: string; category_id?: number | null; tags?: string[]; icon?: string | null }
     ): Promise<Prompt | null> => {
       if (!tauri) {
         setPrompts((prev) =>
@@ -225,17 +229,21 @@ export function useAppData() {
 
   const removePrompt = useCallback(
     async (id: number): Promise<boolean> => {
-      if (!tauri) {
-        setPrompts((prev) => prev.filter((p) => p.id !== id));
-        return true;
-      }
+      // Always remove from local state immediately for responsive UI
+      setPrompts((prev) => prev.filter((p) => p.id !== id));
+
+      if (!tauri) return true;
 
       try {
         await api.deletePrompt(id);
-        setPrompts((prev) => prev.filter((p) => p.id !== id));
         return true;
       } catch (e) {
         console.error("Failed to delete prompt:", e);
+        // Re-fetch to restore consistency if backend delete failed
+        try {
+          const proms = await api.getPrompts();
+          setPrompts(proms);
+        } catch { /* ignore */ }
         return false;
       }
     },
@@ -268,6 +276,63 @@ export function useAppData() {
       } catch (e) {
         console.error("Failed to create category:", e);
         return null;
+      }
+    },
+    [tauri]
+  );
+
+  const renameCategory = useCallback(
+    async (id: number, name: string): Promise<boolean> => {
+      if (!tauri) {
+        setFlatCategories((prev) => {
+          const next = prev.map((c) => (c.id === id ? { ...c, name } : c));
+          setCategories(buildCategoryTree(next));
+          return next;
+        });
+        return true;
+      }
+
+      try {
+        await api.renameCategory(id, name);
+        const cats = await api.getCategories();
+        setFlatCategories(cats);
+        setCategories(buildCategoryTree(cats));
+        return true;
+      } catch (e) {
+        console.error("Failed to rename category:", e);
+        return false;
+      }
+    },
+    [tauri]
+  );
+
+  const deleteCategory = useCallback(
+    async (id: number): Promise<boolean> => {
+      if (!tauri) {
+        setFlatCategories((prev) => {
+          const next = prev.filter((c) => c.id !== id);
+          setCategories(buildCategoryTree(next));
+          return next;
+        });
+        setPrompts((prev) =>
+          prev.map((p) => (p.category_id === id ? { ...p, category_id: null } : p))
+        );
+        return true;
+      }
+
+      try {
+        await api.deleteCategory(id);
+        const [cats, proms] = await Promise.all([
+          api.getCategories(),
+          api.getPrompts(),
+        ]);
+        setFlatCategories(cats);
+        setCategories(buildCategoryTree(cats));
+        setPrompts(proms);
+        return true;
+      } catch (e) {
+        console.error("Failed to delete category:", e);
+        return false;
       }
     },
     [tauri]
@@ -317,6 +382,8 @@ export function useAppData() {
     savePrompt,
     removePrompt,
     addCategory,
+    renameCategory,
+    deleteCategory,
     searchPrompts: searchPromptsLocal,
   };
 }

@@ -13,6 +13,7 @@ import ConflictDialog from "./components/ConflictDialog";
 import UnlockDialog from "./components/UnlockDialog";
 import SetPasswordDialog from "./components/SetPasswordDialog";
 import ShortcutsDialog from "./components/ShortcutsDialog";
+import SettingsDialog, { getStripeColor, type EditorSettings } from "./components/SettingsDialog";
 import {
   getConflictInfo,
   getSyncConfig,
@@ -58,6 +59,29 @@ export default function App() {
   const [inspectorWidth, setInspectorWidth] = useState(280);
   const [inspectorOpen, setInspectorOpen] = useState(true);
 
+  // Editor preferences (persisted in localStorage)
+  const [editorSettings, setEditorSettings] = useState<EditorSettings>(() => ({
+    stripedLines: localStorage.getItem("pv-striped-lines") === "true",
+    stripeColor: localStorage.getItem("pv-stripe-color") || "cool",
+    minimap: localStorage.getItem("pv-minimap") !== "false",
+  }));
+  const [settingsOpen, setSettingsOpen] = useState(false);
+
+  const updateEditorSettings = useCallback((next: EditorSettings) => {
+    setEditorSettings(next);
+    localStorage.setItem("pv-striped-lines", String(next.stripedLines));
+    localStorage.setItem("pv-stripe-color", next.stripeColor);
+    localStorage.setItem("pv-minimap", String(next.minimap));
+  }, []);
+
+  // Keep CSS variable in sync with stripe color choice
+  useEffect(() => {
+    document.documentElement.style.setProperty(
+      "--pv-stripe-color",
+      getStripeColor(editorSettings.stripeColor)
+    );
+  }, [editorSettings.stripeColor]);
+
   // Modal state
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const [newPromptDialogOpen, setNewPromptDialogOpen] = useState(false);
@@ -88,6 +112,8 @@ export default function App() {
     savePrompt,
     removePrompt,
     addCategory,
+    renameCategory,
+    deleteCategory,
     searchPrompts,
   } = useAppData();
 
@@ -150,12 +176,6 @@ export default function App() {
       .catch(() => {});
   }, [loading]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const filteredPrompts = prompts.filter((p) => {
-    if (selectedCategory !== null && p.category_id !== selectedCategory) return false;
-    if (activeTagFilter && !p.tags.includes(activeTagFilter)) return false;
-    return true;
-  });
-
   const activeSnippet = prompts.find((s) => s.id === activeTab) || null;
 
   const openSnippet = useCallback(
@@ -200,13 +220,18 @@ export default function App() {
 
   const handleDeletePrompt = useCallback(
     async (id: number) => {
-      const ok = await removePrompt(id);
-      if (ok) {
-        closeTab(id);
-        embeddings.removeFromIndex(id);
-      }
+      await removePrompt(id);
+      closeTab(id);
+      embeddings.removeFromIndex(id);
     },
     [removePrompt, closeTab, embeddings]
+  );
+
+  const handleMovePrompt = useCallback(
+    async (promptId: number, categoryId: number | null) => {
+      await savePrompt(promptId, { category_id: categoryId });
+    },
+    [savePrompt]
   );
 
   // Resizable dividers
@@ -292,7 +317,7 @@ export default function App() {
   if (lockState === "checking") {
     return (
       <div className="flex items-center justify-center h-screen w-screen bg-darcula-bg">
-        <div className="text-4xl animate-pulse text-darcula-accent-bright">⬡</div>
+        <img src="./icon.png" alt="PromptVault" className="w-12 h-12 animate-pulse" />
       </div>
     );
   }
@@ -312,7 +337,7 @@ export default function App() {
     return (
       <div className="flex items-center justify-center h-screen w-screen bg-darcula-bg">
         <div className="text-center">
-          <div className="text-4xl mb-3 animate-pulse">⬡</div>
+          <img src="./icon.png" alt="PromptVault" className="w-12 h-12 mb-3 animate-pulse mx-auto" />
           <div className="font-mono text-sm text-darcula-text-muted">
             Initializing PromptVault...
           </div>
@@ -329,8 +354,9 @@ export default function App() {
         data-tauri-drag-region
       >
         <div className="flex items-center gap-2">
+          <img src="./icon.png" alt="" className="w-5 h-5" />
           <span className="text-darcula-accent-bright font-mono font-bold text-sm">
-            ⬡ PromptVault
+            PromptVault
           </span>
           <span className="text-darcula-text-muted text-2xs font-mono">
             v1.0.0
@@ -371,6 +397,13 @@ export default function App() {
             {isEncrypted ? "🔒" : "🔓"}
           </button>
           <button
+            className="hover:text-darcula-text transition-colors text-base leading-none"
+            onClick={() => setSettingsOpen(true)}
+            title="Settings"
+          >
+            ⚙
+          </button>
+          <button
             className="hover:text-darcula-text transition-colors"
             onClick={() => setShortcutsOpen(true)}
             title={`Keyboard Shortcuts (${shortcuts.shortcuts})`}
@@ -400,7 +433,6 @@ export default function App() {
           <Sidebar
             categories={categories}
             tags={tags}
-            prompts={filteredPrompts}
             allPrompts={prompts}
             selectedCategory={selectedCategory}
             activeTagFilter={activeTagFilter}
@@ -409,6 +441,9 @@ export default function App() {
             onOpenSnippet={openSnippet}
             onNewPrompt={() => setNewPromptDialogOpen(true)}
             onNewCategory={addCategory}
+            onRenameCategory={renameCategory}
+            onDeleteCategory={deleteCategory}
+            onMovePrompt={handleMovePrompt}
           />
         </div>
 
@@ -419,6 +454,8 @@ export default function App() {
             prompts={prompts}
             openTabs={openTabs}
             activeTab={activeTab}
+            stripedLines={editorSettings.stripedLines}
+            minimap={editorSettings.minimap}
             onSelectTab={setActiveTab}
             onCloseTab={closeTab}
             onSave={savePrompt}
@@ -513,6 +550,14 @@ export default function App() {
             setSetPasswordOpen(false);
             getDbLockStatus().then((s) => setIsEncrypted(s.encrypted)).catch(() => {});
           }}
+        />
+      )}
+
+      {settingsOpen && (
+        <SettingsDialog
+          settings={editorSettings}
+          onUpdate={updateEditorSettings}
+          onClose={() => setSettingsOpen(false)}
         />
       )}
 
